@@ -1,0 +1,411 @@
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { spawn, type ChildProcess } from "node:child_process";
+import {
+  Client, GatewayIntentBits, Events, AttachmentBuilder,
+  REST, Routes, SlashCommandBuilder,
+  type Message, type Collection, type Snowflake,
+} from "discord.js";
+
+// --- ThreadMap ---
+
+type ThreadEntry = {
+  sessionId: string;
+  cwd: string;
+  model: string;
+  createdAt: number;
+  started: boolean;
+  lastBotMessageId?: string;
+};
+
+type ThreadMap = Record<string, ThreadEntry>;
+
+const MAP_PATH = path.join(import.meta.dirname, "..", "thread-map.json");
+
+function loadMap(): ThreadMap {
+  try {
+    return JSON.parse(fs.readFileSync(MAP_PATH, "utf8")) as ThreadMap;
+  } catch {
+    return {};
+  }
+}
+
+function saveMap(map: ThreadMap): void {
+  fs.writeFileSync(MAP_PATH, JSON.stringify(map, null, 2));
+}
+
+function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): ThreadEntry {
+  if (!map[threadId]) {
+    map[threadId] = {
+      sessionId: crypto.randomUUID(),
+      cwd: defaultCwd,
+      model: "opus",
+      createdAt: Date.now(),
+      started: false,
+    };
+    saveMap(map);
+  }
+  return map[threadId];
+}
+
+// --- Thread History ---
+
+const SYSTEM_PROMPT = [
+  "You are a Discord bot running inside a thread.",
+  "Multiple users may be talking in the same thread.",
+  "When thread history is provided, use it as context to understand the conversation so far.",
+  "Reply naturally as a participant in the group conversation.",
+  "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
+  "Respond directly and immediately to the user's message.",
+].join(" ");
+
+const HISTORY_FETCH_LIMIT = 30;
+
+async function fetchThreadHistory(
+  channel: Message["channel"],
+  entry: ThreadEntry,
+  botUserId: string,
+): Promise<string> {
+  const fetchOpts: { limit: number; after?: string } = { limit: HISTORY_FETCH_LIMIT };
+  if (entry.started && entry.lastBotMessageId) {
+    fetchOpts.after = entry.lastBotMessageId;
+  }
+
+  let messages: Collection<Snowflake, Message>;
+  try {
+    messages = await channel.messages.fetch(fetchOpts);
+  } catch {
+    return "";
+  }
+
+  if (messages.size === 0) return "";
+
+  const sorted = [...messages.values()]
+    .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+    // Filter out bot's own messages (already in session via --resume)
+    .filter((m) => m.author.id !== botUserId);
+
+  if (sorted.length === 0) return "";
+
+  const lines = sorted.map((m) => {
+    const name = m.member?.displayName ?? m.author.displayName ?? m.author.username;
+    const text = m.content.replace(/<@!?\d+>/g, "").trim();
+    return text ? `[${name}] ${text}` : null;
+  }).filter(Boolean);
+
+  if (lines.length === 0) return "";
+
+  const label = entry.started
+    ? "Messages from other users since your last reply"
+    : "Recent thread history for context";
+
+  return `[${label}]\n${lines.join("\n")}\n[End]\n\n`;
+}
+
+// --- Runner ---
+
+const running = new Map<string, ChildProcess>();
+
+type RunResult = { text: string; exitCode: number };
+
+function runClaude(opts: {
+  sessionId: string;
+  prompt: string;
+  cwd: string;
+  model: string;
+  claudeBin: string;
+  resume: boolean;
+  systemPrompt?: string;
+  timeoutMs?: number;
+}): Promise<RunResult> {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-p", opts.prompt,
+      ...(opts.resume ? ["--resume", opts.sessionId] : ["--session-id", opts.sessionId]),
+      "--model", opts.model,
+      "--dangerously-skip-permissions",
+      ...(opts.systemPrompt ? ["--system-prompt", opts.systemPrompt] : []),
+    ];
+
+    const child = spawn(opts.claudeBin, args, {
+      cwd: opts.cwd,
+      env: { ...process.env, CLAUDECODE: undefined },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    running.set(opts.sessionId, child);
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+
+    const timeout = opts.timeoutMs ?? 600_000; // 10 minutes
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      running.delete(opts.sessionId);
+      child.kill("SIGTERM");
+      reject(new Error(`Timeout after ${timeout}ms`));
+    }, timeout);
+
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      running.delete(opts.sessionId);
+      reject(err);
+    });
+
+    // Use "close" instead of "exit" to ensure all stdio data is fully read
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      running.delete(opts.sessionId);
+      const text = stdout.trim() || stderr.trim() || "(no output)";
+      resolve({ text, exitCode: code ?? 1 });
+    });
+  });
+}
+
+// --- Discord ---
+
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN!;
+const DEFAULT_CWD = process.env.DEFAULT_CWD ?? process.cwd();
+const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
+const GUILD_ID = process.env.GUILD_ID;
+const MAX_INLINE = 1500;
+
+const slashCommands = [
+  new SlashCommandBuilder().setName("help").setDescription("Show available commands"),
+  new SlashCommandBuilder().setName("new").setDescription("Clear context — start a new conversation (thread only)"),
+  new SlashCommandBuilder().setName("model").setDescription("Switch Claude model")
+    .addStringOption(o => o.setName("name").setDescription("Model name (e.g. sonnet, opus, haiku)").setRequired(true)),
+  new SlashCommandBuilder().setName("cd").setDescription("Switch working directory")
+    .addStringOption(o => o.setName("path").setDescription("Absolute path to directory").setRequired(true)),
+  new SlashCommandBuilder().setName("stop").setDescription("Kill running Claude process (thread only)"),
+  new SlashCommandBuilder().setName("sessions").setDescription("List all active sessions"),
+];
+
+if (!DISCORD_TOKEN) {
+  console.error("Missing DISCORD_TOKEN");
+  process.exit(1);
+}
+
+const threadMap = loadMap();
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+});
+
+client.once(Events.ClientReady, async (c) => {
+  console.log(`[discord-cc-bot] ready as ${c.user.tag}`);
+  const rest = new REST().setToken(DISCORD_TOKEN);
+  try {
+    const route = GUILD_ID
+      ? Routes.applicationGuildCommands(c.user.id, GUILD_ID)
+      : Routes.applicationCommands(c.user.id);
+    await rest.put(route, {
+      body: slashCommands.map(cmd => cmd.toJSON()),
+    });
+    console.log(`[discord-cc-bot] registered ${slashCommands.length} slash commands`);
+  } catch (err) {
+    console.error("[discord-cc-bot] failed to register commands:", err);
+  }
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName } = interaction;
+
+  try {
+    if (commandName === "help") {
+      await interaction.reply({
+        content: [
+          "`/new` — clear context, start new conversation (thread only)",
+          "`/model <name>` — switch model (e.g. sonnet, opus, haiku)",
+          "`/cd <path>` — switch working directory",
+          "`/stop` — kill running task (thread only)",
+          "`/sessions` — list all sessions",
+        ].join("\n"),
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (commandName === "new") {
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+      entry.sessionId = crypto.randomUUID();
+      entry.started = false;
+      saveMap(threadMap);
+      await interaction.reply({ content: "Context cleared. Next message starts a new conversation.", ephemeral: true });
+      return;
+    }
+
+    if (commandName === "model") {
+      const name = interaction.options.getString("name", true);
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+      entry.model = name;
+      saveMap(threadMap);
+      await interaction.reply({ content: `Model -> \`${name}\``, ephemeral: true });
+      return;
+    }
+
+    if (commandName === "cd") {
+      const dir = interaction.options.getString("path", true);
+      if (!fs.existsSync(dir)) {
+        await interaction.reply({ content: `Path not found: \`${dir}\``, ephemeral: true });
+        return;
+      }
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+      entry.cwd = dir;
+      saveMap(threadMap);
+      await interaction.reply({ content: `cwd -> \`${dir}\``, ephemeral: true });
+      return;
+    }
+
+    if (commandName === "stop") {
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const entry = threadMap[threadId];
+      if (entry && running.has(entry.sessionId)) {
+        running.get(entry.sessionId)!.kill("SIGTERM");
+        await interaction.reply({ content: "Stopped.", ephemeral: true });
+      } else {
+        await interaction.reply({ content: "Nothing running.", ephemeral: true });
+      }
+      return;
+    }
+
+    if (commandName === "sessions") {
+      const lines = Object.entries(threadMap).map(
+        ([tid, e]) => `<#${tid}> | ${e.model} | \`${e.cwd}\``,
+      );
+      await interaction.reply({
+        content: lines.length ? lines.join("\n") : "No sessions.",
+        ephemeral: true,
+      });
+      return;
+    }
+  } catch (err) {
+    console.error("[discord-cc-bot] interaction error:", (err as Error).message);
+    if (!interaction.replied) {
+      await interaction.reply({ content: "An error occurred.", ephemeral: true }).catch(() => {});
+    }
+  }
+});
+
+client.on(Events.MessageCreate, async (message) => {
+  try {
+    if (message.author.bot) return;
+
+    // Only respond in threads, and only when mentioned
+    if (!message.channel.isThread()) return;
+    if (!message.mentions.has(client.user!.id)) return;
+
+    const content = message.content.replace(/<@!?\d+>/g, "").trim();
+    if (!content) return;
+
+    const threadId = message.channelId;
+    const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+
+    if (running.has(entry.sessionId)) {
+      await message.reply("Previous task still running. Use `/stop` first.");
+      return;
+    }
+
+    await message.channel.sendTyping();
+    const typingInterval = setInterval(() => {
+      message.channel.sendTyping().catch(() => {});
+    }, 8_000);
+
+    const pending = await message.reply("Processing...");
+
+    try {
+      const history = await fetchThreadHistory(message.channel, entry, client.user!.id);
+      const prompt = history ? `${history}${content}` : content;
+
+      const result = await runClaude({
+        sessionId: entry.sessionId,
+        prompt,
+        cwd: entry.cwd,
+        model: entry.model,
+        claudeBin: CLAUDE_BIN,
+        resume: entry.started,
+        systemPrompt: SYSTEM_PROMPT,
+      });
+
+      clearInterval(typingInterval);
+
+      const isFirstReply = !entry.started;
+      if (isFirstReply) {
+        entry.started = true;
+      }
+
+      const disclosure = isFirstReply
+        ? "*I'm Claude, an AI assistant by Anthropic.*\n\n"
+        : "";
+      const responseText = `${disclosure}${result.text}`;
+
+      let botReply: Message;
+      try {
+        await pending.delete().catch(() => {});
+        if (responseText.length <= MAX_INLINE) {
+          botReply = await message.reply(responseText);
+        } else {
+          const buf = Buffer.from(result.text, "utf8");
+          const file = new AttachmentBuilder(buf, { name: "response.txt" });
+          const preview = disclosure + result.text.slice(0, 200) + "...";
+          botReply = await message.reply({ content: preview, files: [file] });
+        }
+      } catch (replyErr) {
+        console.error("[discord-cc-bot] reply failed, trying channel.send fallback:", (replyErr as Error).message);
+        // Fallback: send to channel directly instead of replying
+        botReply = await message.channel.send(responseText.slice(0, 2000));
+      }
+
+      entry.lastBotMessageId = botReply.id;
+      saveMap(threadMap);
+    } catch (err) {
+      clearInterval(typingInterval);
+      await pending.delete().catch(() => {});
+      await message.reply(`Error: ${(err as Error).message}`);
+    }
+  } catch (err) {
+    console.error("[discord-cc-bot] handler error:", (err as Error).message);
+  }
+});
+
+process.on("SIGINT", () => {
+  for (const child of running.values()) child.kill("SIGTERM");
+  client.destroy();
+  process.exit(0);
+});
+
+client.login(DISCORD_TOKEN);

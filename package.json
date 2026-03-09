@@ -1,0 +1,21 @@
+{
+  "name": "discord-claude-code-bot",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fredchu/discord-claude-code-bot.git"
+  },
+  "scripts": {
+    "start": "node --env-file=.env --import=tsx src/index.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "discord.js": "^14.22.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.2"
+  }
+}
