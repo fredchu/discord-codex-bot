@@ -504,16 +504,14 @@ client.on(Events.MessageCreate, async (message) => {
         : "";
       const responseText = `${disclosure}${result.text}`;
 
-      // Final delivery
+      // Final delivery — always delete preview and send new message
+      // so Discord sends a push notification for the completed reply.
       let botReply: Message;
       try {
+        await previewState.msg!.delete().catch(() => {});
         if (responseText.length <= DISCORD_MAX_LEN) {
-          // Edit the preview message with final text
-          await previewState.msg!.edit(responseText);
-          botReply = previewState.msg!;
+          botReply = await message.reply(responseText);
         } else {
-          // Delete preview, send chunked
-          await previewState.msg!.delete().catch(() => {});
           botReply = await sendChunked(message.channel, responseText, message);
         }
       } catch (replyErr) {
