@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 - 2026-03-19
+
+### Fixes
+- Send final reply as new message instead of editing preview, ensuring Discord push notifications are triggered
+
 ## 0.2.0 - 2026-03-16
 
 ### Features
