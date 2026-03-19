@@ -185,13 +185,22 @@ function runClaudeStreaming(opts: {
       }
     });
 
-    const timeout = opts.timeoutMs ?? 600_000;
+    const timeout = opts.timeoutMs ?? 1_800_000;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       running.delete(opts.sessionId);
       child.kill("SIGTERM");
-      reject(new Error(`Timeout after ${timeout}ms`));
+      const partial = resultText || lastSeenText || "";
+      if (partial) {
+        resolve({
+          text: partial + "\n\n⚠️ *Task timed out after 30 min — partial result above.*",
+          exitCode: 124,
+          costUsd,
+        });
+      } else {
+        reject(new Error(`Timeout after ${timeout}ms with no output`));
+      }
     }, timeout);
 
     child.on("error", (err) => {
@@ -252,15 +261,31 @@ type PreviewState = {
   lastEditTime: number;
   timer: NodeJS.Timeout | null;
   pendingText: string;
+  startTime: number;
+  toolsUsed: string[];
 };
 
 function createPreviewState(): PreviewState {
-  return { msg: null, lastText: "", lastEditTime: 0, timer: null, pendingText: "" };
+  return { msg: null, lastText: "", lastEditTime: 0, timer: null, pendingText: "", startTime: Date.now(), toolsUsed: [] };
+}
+
+function formatElapsed(startTime: number): string {
+  const elapsed = Math.round((Date.now() - startTime) / 1000);
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  return mins > 0 ? `${mins}m${secs}s` : `${secs}s`;
+}
+
+function buildStatusLine(ps: PreviewState): string {
+  const time = formatElapsed(ps.startTime);
+  const toolLine = ps.toolsUsed.length > 0
+    ? `🔧 ${ps.toolsUsed.slice(-3).join(" → ")}\n` : "";
+  return `\n\n${toolLine}⏳ *working... (${time})*`;
 }
 
 function flushPreview(ps: PreviewState): void {
   if (!ps.msg || !ps.pendingText) return;
-  const display = ps.pendingText.slice(0, PREVIEW_MAX_LEN) + "\n\n⏳ *streaming...*";
+  const display = ps.pendingText.slice(0, PREVIEW_MAX_LEN) + buildStatusLine(ps);
   ps.msg.edit(display).catch(() => {});
   ps.lastText = ps.pendingText;
   ps.lastEditTime = Date.now();
@@ -487,6 +512,12 @@ client.on(Events.MessageCreate, async (message) => {
           onText: (fullText) => handleStreamText(previewState, fullText),
           onToolUse: (toolName) => {
             console.log(`[discord-cc-bot] tool: ${toolName}`);
+            previewState.toolsUsed.push(toolName);
+            if (previewState.msg) {
+              const text = (previewState.pendingText || "").slice(0, PREVIEW_MAX_LEN);
+              const display = text + buildStatusLine(previewState);
+              previewState.msg.edit(display).catch(() => {});
+            }
           },
         },
       });
