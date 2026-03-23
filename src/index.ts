@@ -67,6 +67,7 @@ async function fetchThreadHistory(
   channel: Message["channel"],
   entry: ThreadEntry,
   botUserId: string,
+  currentMessageId?: string,
 ): Promise<string> {
   const fetchOpts: { limit: number; after?: string } = { limit: HISTORY_FETCH_LIMIT };
   if (entry.started && entry.lastBotMessageId) {
@@ -84,7 +85,7 @@ async function fetchThreadHistory(
 
   const sorted = [...messages.values()]
     .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
-    .filter((m) => m.author.id !== botUserId);
+    .filter((m) => m.author.id !== botUserId && m.id !== currentMessageId);
 
   if (sorted.length === 0) return "";
 
@@ -640,7 +641,7 @@ client.on(Events.MessageCreate, async (message) => {
     previewState.msg = await message.reply("⏳ *Thinking...*");
 
     try {
-      const history = await fetchThreadHistory(message.channel, entry, client.user!.id);
+      const history = await fetchThreadHistory(message.channel, entry, client.user!.id, message.id);
       const prompt = history ? `${history}${content}` : content;
 
       const result = await runClaudeStreaming({
