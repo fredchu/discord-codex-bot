@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 - 2026-03-23
+
+### Fixes
+- Fix duplicate message in thread history — current trigger message was included in the history block and appended again as prompt content
+
 ## 0.4.0 - 2026-03-23
 
 ### Features
