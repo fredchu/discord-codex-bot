@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0 - 2026-03-25
+
+### Features
+- `/resume-local` command — resume a local terminal Claude Code session from Discord (mobile use case)
+  - Auto-discover active sessions from `~/.claude/sessions/` PID files
+  - Fallback to recent sessions from `~/.claude/history.jsonl` with last prompt display
+  - Select menu for multiple sessions, showing last prompt + project path
+  - Blocks resume of still-running sessions (must `/quit` in terminal first)
+- `/handback` command — hand session back to terminal, reset thread to fresh bot session
+- Dedicated `RESUME_SYSTEM_PROMPT` for resumed sessions (lighter than bot system prompt)
+- `isLocalResume` flag in DB to distinguish bot-created vs resumed sessions
+- Capture stderr from Claude CLI — show error details instead of bare `(no output)`
+
 ## 0.5.0 - 2026-03-23
 
 ### Features

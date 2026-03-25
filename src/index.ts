@@ -7,6 +7,7 @@ import {
   Client, GatewayIntentBits, Events,
   REST, Routes, SlashCommandBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
   type Message, type Collection, type Snowflake,
 } from "discord.js";
 
@@ -19,6 +20,7 @@ type ThreadEntry = {
   createdAt: number;
   started: boolean;
   lastBotMessageId?: string;
+  isLocalResume?: boolean;
 };
 
 type ThreadMap = Record<string, ThreadEntry>;
@@ -36,8 +38,12 @@ db.exec(`CREATE TABLE IF NOT EXISTS threads (
   model TEXT NOT NULL,
   createdAt INTEGER NOT NULL,
   started INTEGER NOT NULL DEFAULT 0,
-  lastBotMessageId TEXT
+  lastBotMessageId TEXT,
+  isLocalResume INTEGER NOT NULL DEFAULT 0
 )`);
+
+// Migration: add isLocalResume column if missing
+try { db.exec("ALTER TABLE threads ADD COLUMN isLocalResume INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
 
 // One-time migration from JSON → SQLite
 if (fs.existsSync(JSON_PATH)) {
@@ -63,8 +69,8 @@ if (fs.existsSync(JSON_PATH)) {
 // Prepared statements
 const stmtGet = db.prepare("SELECT * FROM threads WHERE threadId = ?");
 const stmtUpsert = db.prepare(
-  `INSERT OR REPLACE INTO threads (threadId, sessionId, cwd, model, createdAt, started, lastBotMessageId)
-   VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId)`,
+  `INSERT OR REPLACE INTO threads (threadId, sessionId, cwd, model, createdAt, started, lastBotMessageId, isLocalResume)
+   VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId, @isLocalResume)`,
 );
 const stmtAll = db.prepare("SELECT * FROM threads");
 
@@ -76,6 +82,7 @@ function rowToEntry(row: any): ThreadEntry {
     createdAt: row.createdAt,
     started: !!row.started,
     lastBotMessageId: row.lastBotMessageId ?? undefined,
+    isLocalResume: !!row.isLocalResume,
   };
 }
 
@@ -96,6 +103,7 @@ function saveEntry(threadId: string, entry: ThreadEntry): void {
     createdAt: entry.createdAt,
     started: entry.started ? 1 : 0,
     lastBotMessageId: entry.lastBotMessageId ?? null,
+    isLocalResume: entry.isLocalResume ? 1 : 0,
   });
 }
 
@@ -118,6 +126,109 @@ function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): Thre
   return map[threadId];
 }
 
+// --- Local Session Discovery ---
+
+const CLAUDE_HOME = path.join(process.env.HOME ?? "", ".claude");
+
+type LocalSession = {
+  sessionId: string;
+  cwd: string;
+  pid?: number;
+  alive: boolean;
+  startedAt?: number;
+  mtime: number;
+  lastPrompt?: string;
+};
+
+function isProcessAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function discoverLocalSessions(): LocalSession[] {
+  const sessions: LocalSession[] = [];
+
+  // Active sessions from PID files — these have reliable CWD
+  const sessionsDir = path.join(CLAUDE_HOME, "sessions");
+  if (fs.existsSync(sessionsDir)) {
+    for (const file of fs.readdirSync(sessionsDir)) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(sessionsDir, file), "utf8"));
+        const alive = isProcessAlive(data.pid);
+        // Skip stale PID files (process dead)
+        if (!alive) continue;
+        sessions.push({
+          sessionId: data.sessionId,
+          cwd: data.cwd,
+          pid: data.pid,
+          alive: true,
+          startedAt: data.startedAt,
+          mtime: data.startedAt ?? 0,
+        });
+      } catch { /* skip malformed */ }
+    }
+  }
+
+  // Also check history.jsonl for recent sessions + last prompt per session
+  const historyPath = path.join(CLAUDE_HOME, "history.jsonl");
+  const promptBySession = new Map<string, string>(); // sessionId → last prompt
+  if (fs.existsSync(historyPath)) {
+    const seen = new Set(sessions.map(s => s.sessionId));
+    try {
+      const lines = fs.readFileSync(historyPath, "utf8").trim().split("\n");
+      // Read last 50 lines to get enough prompt context
+      const recent = lines.slice(-50);
+      const bySession = new Map<string, { cwd: string; mtime: number }>();
+      for (const line of recent) {
+        try {
+          const entry = JSON.parse(line);
+          const cwd = entry.cwd || entry.project;
+          if (entry.sessionId) {
+            if (entry.display) {
+              promptBySession.set(entry.sessionId, entry.display);
+            }
+            if (cwd) {
+              bySession.set(entry.sessionId, {
+                cwd,
+                mtime: typeof entry.timestamp === "number" ? entry.timestamp : 0,
+              });
+            }
+          }
+        } catch { /* skip */ }
+      }
+      // Add top 5 unseen sessions
+      const candidates = [...bySession.entries()]
+        .filter(([sid]) => !seen.has(sid))
+        .sort((a, b) => b[1].mtime - a[1].mtime)
+        .slice(0, 5);
+      for (const [sid, info] of candidates) {
+        sessions.push({
+          sessionId: sid,
+          cwd: info.cwd,
+          alive: false,
+          mtime: info.mtime,
+          lastPrompt: promptBySession.get(sid),
+        });
+      }
+    } catch { /* skip */ }
+  }
+
+  // Attach lastPrompt to PID-discovered sessions too
+  for (const s of sessions) {
+    if (!s.lastPrompt && promptBySession.has(s.sessionId)) {
+      s.lastPrompt = promptBySession.get(s.sessionId);
+    }
+  }
+
+  // Sort: alive first, then by mtime descending
+  sessions.sort((a, b) => {
+    if (a.alive !== b.alive) return a.alive ? -1 : 1;
+    return b.mtime - a.mtime;
+  });
+
+  return sessions;
+}
+
 // --- Thread History ---
 
 const SYSTEM_PROMPT = [
@@ -125,6 +236,13 @@ const SYSTEM_PROMPT = [
   "Multiple users may be talking in the same thread.",
   "When thread history is provided, use it as context to understand the conversation so far.",
   "Reply naturally as a participant in the group conversation.",
+  "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
+  "Respond directly and immediately to the user's message.",
+].join(" ");
+
+const RESUME_SYSTEM_PROMPT = [
+  "User is continuing this conversation from Discord (mobile).",
+  "This is the same session, just a different interface — respond normally.",
   "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
   "Respond directly and immediately to the user's message.",
 ].join(" ");
@@ -228,11 +346,16 @@ function runClaudeStreaming(opts: {
     running.set(opts.sessionId, child);
 
     let buffer = "";
+    let stderrBuf = "";
     let lastSeenText = "";
     let resultText = "";
     let costUsd: number | undefined;
     let permissionDenials: PermissionDenial[] | undefined;
     let settled = false;
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrBuf += chunk.toString();
+    });
 
     child.stdout.on("data", (chunk: Buffer) => {
       buffer += chunk.toString();
@@ -303,7 +426,8 @@ function runClaudeStreaming(opts: {
       settled = true;
       clearTimeout(timer);
       running.delete(opts.sessionId);
-      const text = resultText || lastSeenText || "(no output)";
+      const errHint = stderrBuf.trim() ? `\n\n⚠️ stderr: ${stderrBuf.trim().slice(0, 500)}` : "";
+      const text = resultText || lastSeenText || `(no output)${errHint}`;
       resolve({ text, exitCode: code ?? 1, costUsd, permissionDenials });
     });
   });
@@ -546,6 +670,9 @@ const slashCommands = [
     .addStringOption(o => o.setName("path").setDescription("Absolute path to directory").setRequired(true)),
   new SlashCommandBuilder().setName("stop").setDescription("Kill running Claude process (thread only)"),
   new SlashCommandBuilder().setName("sessions").setDescription("List all active sessions"),
+  new SlashCommandBuilder().setName("resume-local").setDescription("Resume a local terminal Claude Code session")
+    .addStringOption(o => o.setName("session").setDescription("Session ID (auto-detect if omitted)").setRequired(false)),
+  new SlashCommandBuilder().setName("handback").setDescription("Hand session back to terminal"),
 ];
 
 if (!DISCORD_TOKEN) {
@@ -663,6 +790,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  // --- Select menu handler (resume-local session picker) ---
+  if (interaction.isStringSelectMenu() && interaction.customId === "resume_local_select") {
+    const sessionId = interaction.values[0];
+    const threadId = interaction.channelId;
+    const locals = discoverLocalSessions();
+    const picked = locals.find(s => s.sessionId === sessionId);
+    const cwd = picked?.cwd ?? DEFAULT_CWD;
+    const alive = picked?.alive ?? false;
+
+    const entry = getOrCreate(threadMap, threadId, cwd);
+    entry.sessionId = sessionId;
+    entry.cwd = cwd;
+    entry.isLocalResume = true;
+    entry.started = true;
+    saveEntry(threadId, entry);
+
+    const status = alive ? "🟢 terminal still running" : "🔵 inactive";
+    await interaction.update({
+      content:
+        `📱 已接手本地 session \`${sessionId.slice(0, 8)}…\` (${status})\n` +
+        `cwd: \`${cwd}\`\n\n` +
+        (alive ? `> ⚠️ Terminal CC 還在跑。建議先在 terminal 輸入 \`/quit\`。\n` : "") +
+        `> 💻 回到 terminal 後：\`/quit\` → \`claude --continue\``,
+      components: [],
+    });
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName } = interaction;
@@ -676,6 +831,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           "`/cd <path>` — switch working directory",
           "`/stop` — kill running task (thread only)",
           "`/sessions` — list all sessions",
+          "`/resume-local [session]` — resume a local terminal CC session",
+          "`/handback` — hand session back to terminal",
         ].join("\n"),
         ephemeral: true,
       });
@@ -746,12 +903,126 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (commandName === "sessions") {
       const lines = Object.entries(threadMap).map(
-        ([tid, e]) => `<#${tid}> | ${e.model} | \`${e.cwd}\``,
+        ([tid, e]) => `<#${tid}> | ${e.model} | \`${e.cwd}\`${e.isLocalResume ? " 📱" : ""}`,
       );
       await interaction.reply({
         content: lines.length ? lines.join("\n") : "No sessions.",
         ephemeral: true,
       });
+      return;
+    }
+
+    if (commandName === "resume-local") {
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const explicitId = interaction.options.getString("session");
+
+      if (explicitId) {
+        // Direct resume with explicit session ID
+        const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+        entry.sessionId = explicitId;
+        entry.isLocalResume = true;
+        entry.started = true; // always resume mode for local sessions
+        saveEntry(threadId, entry);
+        await interaction.reply(
+          `📱 已接手本地 session \`${explicitId.slice(0, 8)}…\`\ncwd: \`${entry.cwd}\`\n\n` +
+          `> 💻 回到 terminal 後：\`/quit\` → \`claude --continue\``,
+        );
+        return;
+      }
+
+      // Auto-discover local sessions
+      const locals = discoverLocalSessions();
+      if (locals.length === 0) {
+        await interaction.reply({ content: "No local sessions found.", ephemeral: true });
+        return;
+      }
+
+      // Filter: only sessions that are NOT alive (can't resume a running session)
+      const resumable = locals.filter(s => !s.alive);
+      const aliveCount = locals.length - resumable.length;
+
+      if (resumable.length === 0) {
+        const hint = aliveCount > 0
+          ? `Found ${aliveCount} active session(s), but can't resume a running CC.\n` +
+            `請先在 terminal 輸入 \`/quit\` 退出，再回來 \`/resume-local\`。`
+          : "No local sessions found.";
+        await interaction.reply({ content: hint, ephemeral: true });
+        return;
+      }
+
+      if (resumable.length === 1) {
+        const s = resumable[0];
+        const entry = getOrCreate(threadMap, threadId, s.cwd);
+        entry.sessionId = s.sessionId;
+        entry.cwd = s.cwd;
+        entry.isLocalResume = true;
+        entry.started = true;
+        saveEntry(threadId, entry);
+        const promptHint = s.lastPrompt ? `\nLast prompt: *${s.lastPrompt.slice(0, 100)}*\n` : "\n";
+        await interaction.reply(
+          `📱 已接手本地 session \`${s.sessionId.slice(0, 8)}…\`` +
+          promptHint +
+          `cwd: \`${s.cwd}\`\n\n` +
+          (aliveCount > 0 ? `> ⚠️ 另有 ${aliveCount} 個活躍 session 無法 resume（需先在 terminal \`/quit\`）\n` : "") +
+          `> 💻 回到 terminal 後：\`claude --continue\``,
+        );
+        return;
+      }
+
+      // Multiple resumable sessions — show select menu
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId("resume_local_select")
+        .setPlaceholder("Pick a session to resume")
+        .addOptions(
+          resumable.slice(0, 10).map((s) => {
+            const ago = Math.round((Date.now() - s.mtime) / 60000);
+            const timeStr = ago < 60 ? `${ago}m` : `${Math.round(ago / 60)}h`;
+            const prompt = s.lastPrompt ?? "(no prompt)";
+            // Label: last prompt (max 100 chars, Discord limit)
+            const label = `${prompt.slice(0, 95)}`;
+            // Description: time ago + cwd
+            const project = s.cwd.split("/").slice(-2).join("/");
+            const desc = `${timeStr} ago · ${project}`;
+            return new StringSelectMenuOptionBuilder()
+              .setLabel(label.slice(0, 100) || "(empty)")
+              .setDescription(desc.slice(0, 100))
+              .setValue(s.sessionId);
+          }),
+        );
+
+      const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
+      await interaction.reply({ content: "Select a local session to resume:", components: [row], ephemeral: true });
+      return;
+    }
+
+    if (commandName === "handback") {
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const entry = threadMap[threadId];
+      if (!entry?.isLocalResume) {
+        await interaction.reply({ content: "This thread is not a resumed local session.", ephemeral: true });
+        return;
+      }
+      // Kill any running process
+      if (running.has(entry.sessionId)) {
+        running.get(entry.sessionId)!.kill("SIGTERM");
+      }
+      // Reset to a fresh bot session
+      entry.isLocalResume = false;
+      entry.sessionId = crypto.randomUUID();
+      entry.started = false;
+      saveEntry(threadId, entry);
+      await interaction.reply(
+        `💻 已交還 session。回到 terminal 輸入 \`claude --continue\` 即可看到完整對話。\n` +
+        `此 thread 已重置，下次訊息會開始新的 bot session。`,
+      );
       return;
     }
   } catch (err) {
@@ -796,7 +1067,7 @@ client.on(Events.MessageCreate, async (message) => {
         model: entry.model,
         claudeBin: CLAUDE_BIN,
         resume: entry.started,
-        systemPrompt: SYSTEM_PROMPT,
+        systemPrompt: entry.isLocalResume ? RESUME_SYSTEM_PROMPT : SYSTEM_PROMPT,
         callbacks: {
           onText: (fullText) => handleStreamText(previewState, fullText),
           onToolUse: createToolUseHandler(previewState),
@@ -820,7 +1091,7 @@ client.on(Events.MessageCreate, async (message) => {
         entry.started = true;
       }
 
-      const disclosure = isFirstReply
+      const disclosure = (isFirstReply && !entry.isLocalResume)
         ? "*I'm Claude, an AI assistant by Anthropic.*\n\n"
         : "";
       const responseText = `${disclosure}${result.text}`;
