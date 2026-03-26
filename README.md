@@ -80,7 +80,7 @@ Single-file architecture (`src/index.ts`, ~1000 LOC). Session state is persisted
 
 ## System Prompt
 
-The bot injects a system prompt that tells Claude it's running inside a Discord thread with multiple users. You can customize it by editing the `SYSTEM_PROMPT` constant in `src/index.ts`.
+The bot injects a system prompt that tells Claude it's running inside a Discord thread with multiple users. It also instructs Claude to avoid markdown tables (which Discord cannot render) and provides two alternative comparison formats: bold key-value lines and code block aligned columns. You can customize it by editing the `SYSTEM_PROMPT` constant in `src/index.ts`.
 
 ## Advanced Usage: Terminal Takeover
 
@@ -211,7 +211,7 @@ Discord 討論串          Bot（本 repo）            Claude Code CLI
 
 ## System Prompt
 
-機器人會注入一段 system prompt，告訴 Claude 它正在 Discord 討論串中運行，可能有多位使用者參與。你可以透過編輯 `src/index.ts` 中的 `SYSTEM_PROMPT` 常數來自訂。
+機器人會注入一段 system prompt，告訴 Claude 它正在 Discord 討論串中運行，可能有多位使用者參與。同時指示 Claude 避免使用 markdown 表格（Discord 無法渲染），並提供兩種替代的比較格式：粗體 key-value 行和 code block 等寬對齊。你可以透過編輯 `src/index.ts` 中的 `SYSTEM_PROMPT` 常數來自訂。
 
 ## 進階用法：終端機接管（Terminal Takeover）
 

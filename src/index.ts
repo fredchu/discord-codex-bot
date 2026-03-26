@@ -238,14 +238,34 @@ const SYSTEM_PROMPT = [
   "Reply naturally as a participant in the group conversation.",
   "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
   "Respond directly and immediately to the user's message.",
-].join(" ");
+  "",
+  "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax (| col | col |).",
+  "When comparing items, choose the best format for the situation:",
+  "- Default: bold label + slash-separated attributes on one line per item, e.g. **Opus** — Speed: Slow / Quality: Best / Price: $$$",
+  "- Data-dense: use a code block with monospace-aligned columns, e.g.:",
+  "```",
+  "Opus    Slow     Best   $$$",
+  "Sonnet  Fast     Good   $$",
+  "Haiku   Fastest  OK     $",
+  "```",
+].join("\n");
 
 const RESUME_SYSTEM_PROMPT = [
   "User is continuing this conversation from Discord (mobile).",
   "This is the same session, just a different interface — respond normally.",
   "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
   "Respond directly and immediately to the user's message.",
-].join(" ");
+  "",
+  "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax (| col | col |).",
+  "When comparing items, choose the best format for the situation:",
+  "- Default: bold label + slash-separated attributes on one line per item, e.g. **Opus** — Speed: Slow / Quality: Best / Price: $$$",
+  "- Data-dense: use a code block with monospace-aligned columns, e.g.:",
+  "```",
+  "Opus    Slow     Best   $$$",
+  "Sonnet  Fast     Good   $$",
+  "Haiku   Fastest  OK     $",
+  "```",
+].join("\n");
 
 const HISTORY_FETCH_LIMIT = 30;
 
