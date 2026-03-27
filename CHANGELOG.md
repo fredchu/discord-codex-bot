@@ -4,7 +4,7 @@
 
 ### Improvements
 - System prompt now instructs Claude to avoid markdown tables (Discord cannot render them)
-- Two alternative formats provided: bold key-value lines (default) and code block aligned columns (data-dense)
+- Bold key-value line format for comparisons (mobile-friendly, no horizontal scrolling)
 - Applied to both `SYSTEM_PROMPT` and `RESUME_SYSTEM_PROMPT`
 
 ## 0.7.0 - 2026-03-25

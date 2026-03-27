@@ -240,14 +240,10 @@ const SYSTEM_PROMPT = [
   "Respond directly and immediately to the user's message.",
   "",
   "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax (| col | col |).",
-  "When comparing items, choose the best format for the situation:",
-  "- Default: bold label + slash-separated attributes on one line per item, e.g. **Opus** — Speed: Slow / Quality: Best / Price: $$$",
-  "- Data-dense: use a code block with monospace-aligned columns, e.g.:",
-  "```",
-  "Opus    Slow     Best   $$$",
-  "Sonnet  Fast     Good   $$",
-  "Haiku   Fastest  OK     $",
-  "```",
+  "When comparing items, use bold label + slash-separated attributes on one line per item, e.g.:",
+  "**Opus** — Speed: Slow / Quality: Best / Price: $$$",
+  "**Sonnet** — Speed: Fast / Quality: Good / Price: $$",
+  "**Haiku** — Speed: Fastest / Quality: OK / Price: $",
 ].join("\n");
 
 const RESUME_SYSTEM_PROMPT = [
@@ -257,14 +253,10 @@ const RESUME_SYSTEM_PROMPT = [
   "Respond directly and immediately to the user's message.",
   "",
   "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax (| col | col |).",
-  "When comparing items, choose the best format for the situation:",
-  "- Default: bold label + slash-separated attributes on one line per item, e.g. **Opus** — Speed: Slow / Quality: Best / Price: $$$",
-  "- Data-dense: use a code block with monospace-aligned columns, e.g.:",
-  "```",
-  "Opus    Slow     Best   $$$",
-  "Sonnet  Fast     Good   $$",
-  "Haiku   Fastest  OK     $",
-  "```",
+  "When comparing items, use bold label + slash-separated attributes on one line per item, e.g.:",
+  "**Opus** — Speed: Slow / Quality: Best / Price: $$$",
+  "**Sonnet** — Speed: Fast / Quality: Good / Price: $$",
+  "**Haiku** — Speed: Fastest / Quality: OK / Price: $",
 ].join("\n");
 
 const HISTORY_FETCH_LIMIT = 30;
