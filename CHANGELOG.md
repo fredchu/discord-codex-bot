@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.2 - 2026-04-02
+
+### Fixes
+- Fix bot sessions not appearing in CC's `/resume` picker (CC 2.1.90+ filters `entrypoint:"sdk-cli"`)
+- Patch session files after each run to rewrite entrypoint, making bot sessions discoverable
+
 ## 0.8.1 - 2026-04-02
 
 ### Improvements

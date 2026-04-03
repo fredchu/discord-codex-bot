@@ -130,6 +130,23 @@ function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): Thre
 
 const CLAUDE_HOME = path.join(process.env.HOME ?? "", ".claude");
 
+/**
+ * Patch session file so CC's /resume picker can discover it.
+ * CC 2.1.90+ filters out sessions with entrypoint:"sdk-cli" from the picker.
+ * Rewriting to "cli" makes bot sessions visible alongside interactive ones.
+ */
+function patchSessionEntrypoint(sessionId: string, cwd: string): void {
+  try {
+    const sanitized = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+    const projectDir = path.join(CLAUDE_HOME, "projects", sanitized);
+    const sessionFile = path.join(projectDir, `${sessionId}.jsonl`);
+    if (!fs.existsSync(sessionFile)) return;
+    const content = fs.readFileSync(sessionFile, "utf8");
+    if (!content.includes('"entrypoint":"sdk-cli"')) return;
+    fs.writeFileSync(sessionFile, content.replaceAll('"entrypoint":"sdk-cli"', '"entrypoint":"cli"'));
+  } catch { /* best-effort */ }
+}
+
 type LocalSession = {
   sessionId: string;
   cwd: string;
@@ -792,6 +809,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             botReply = await sendChunked(ch, result.text);
           }
           entry.lastBotMessageId = botReply.id;
+          patchSessionEntrypoint(entry.sessionId, entry.cwd);
           saveEntry(threadId, entry);
         } catch (err) {
           if (previewState.timer) clearTimeout(previewState.timer);
@@ -1161,6 +1179,7 @@ client.on(Events.MessageCreate, async (message) => {
       }
 
       entry.lastBotMessageId = botReply.id;
+      patchSessionEntrypoint(entry.sessionId, entry.cwd);
       saveEntry(threadId, entry);
     } catch (err) {
       if (previewState.timer) clearTimeout(previewState.timer);
