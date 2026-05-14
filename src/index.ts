@@ -953,6 +953,11 @@ function roleFromCommand(commandName: string): CodexRole | null {
   return CODEX_ROLE_COMMANDS[commandName] ?? null;
 }
 
+function extractDispatchResultLabel(resultMd: string): string {
+  const match = resultMd.match(/^RESULT:\s*(.+)$/m);
+  return match?.[1]?.trim() || "unknown";
+}
+
 function buildDispatchOptions(role: CodexRole, interaction: { channelId: string; options: any }): DispatchCodexRoleOptions {
   const threadId = interaction.channelId;
   const workdir = interaction.options.getString("workdir", true);
@@ -981,6 +986,8 @@ function formatDispatchResult(role: CodexRole, result: DispatchCodexRoleResult, 
   const lines = [
     includeDisclosure ? "*I'm Codex, an AI assistant by OpenAI.*\n" : "",
     `**codex-${role}** \`${runId}\``,
+    `RESULT: ${extractDispatchResultLabel(result.resultMd)}`,
+    `POLICY VIOLATION: ${result.policyViolation ? "true" : "false"}`,
     `policy_violation: \`${result.policyViolation ? "true" : "false"}\``,
     `exit_code: \`${result.exitCode}\``,
   ];
