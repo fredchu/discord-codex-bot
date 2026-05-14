@@ -1,24 +1,34 @@
 # Changelog
 
-## 0.1.0 - 2026-05-14 (planned)
+## 0.1.0 - 2026-05-14
 
-### Initial fork
+Initial open-source release of `discord-codex-bot`, forked from [discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot) v0.8.2 and adapted for OpenAI Codex CLI 0.128+.
 
-Forked from [discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot) v0.8.2 — same Discord thread bridging pattern, adapted for OpenAI Codex CLI 0.128+.
+### Features
 
-### Features (planned for v0.1.0)
+- **codex exec runner**: mention replies route prompt, recent thread history, and attachment file paths to `codex exec --json`.
+- **Session resume**: first-run JSONL `thread.started` events provide the Codex `thread_id`; subsequent turns use `codex exec resume <uuid>`.
+- **Sandbox per thread**: Codex runs with native `--sandbox workspace-write` by default and `-C <cwd>`, with optional `THREAD_WORKDIR_ROOT` per-thread directories.
+- **Role contract dispatch**: `/codex-worker`, `/codex-verifier`, `/codex-reviewer`, and `/codex-synthesizer` generate codex-dispatch role packets and post artifact-backed results.
+- **Quota guard**: per-user hourly request limits and per-channel daily input/output token caps are enforced from SQLite quota buckets.
+- **Trust boundary**: guild/channel/DM allowlists, sensitive-path blocklist checks, thread-only execution, and Codex sandboxing gate execution.
+- **AI disclosure**: first bot reply in a session identifies the output as Codex, an AI assistant by OpenAI.
 
-- **codex exec runner**: mention or slash command in allowed channels routes prompt to `codex exec` with thread-scoped session resume
-- **Session resume**: `codex exec --json` parses first SessionConfigured event for session UUID; subsequent turns use `codex exec resume <uuid>`
-- **Sandbox per thread**: each Discord thread maps to an isolated workdir; `codex --sandbox workspace-write` by default (override via env)
-- **Role contract dispatch**: 4 slash commands (`/codex-worker`, `/codex-verifier`, `/codex-reviewer`, `/codex-synthesizer`) mirror `~/.claude/skills/codex-dispatch/` packet format
-- **Quota guard**: per-user rate limit + token cap
-- **Trust boundary**: bot rejects non-allowlisted guilds/channels; sensitive-path blocklist; sandbox-write scope enforced by codex itself
-- **AI disclosure**: every bot response footer marks it as AI-generated
+### Round-by-round
+
+- Round 1: forked the Discord thread bridge and documented the v0.1.0 target.
+- Round 2: adapted the runner from `claude -p` to `codex exec --json` with session resume.
+- Round 3: removed Claude-specific dead code paths.
+- Round 4: added the four codex-dispatch role slash commands.
+- Round 5: added the quota guard.
+- Round 6: added trust-boundary hardening.
+- Round 7: refreshed English docs, added Traditional Chinese docs, and finalized release notes.
+
+Automl run_id: `20260514-130528-9616`.
 
 ### Differences from upstream CC bot
 
-- CLI: `codex exec` instead of `claude -p`; no `--session-id` (codex generates UUID on first run)
-- Sandbox: codex has native `--sandbox` (read-only/workspace-write/danger-full-access); CC bot relied on hook-based protection
-- Auth: ChatGPT subscription default (`codex login`); API key fallback via `OPENAI_API_KEY`
-- No `patchSessionEntrypoint` equivalent — codex sessions are independent of bot
+- CLI: `codex exec` instead of `claude -p`; Codex generates the session UUID on first run.
+- Sandbox: Codex has native `--sandbox` (`read-only`, `workspace-write`, or `danger-full-access`); the upstream Claude Code bot relied on a hook-based protection layer.
+- Auth: ChatGPT subscription auth through `codex login` by default; API key auth depends on your local Codex CLI setup.
+- Session model: no `patchSessionEntrypoint` equivalent; Codex sessions are independent of the bot.

@@ -1,19 +1,22 @@
 # discord-codex-bot
 
-Discord bot that bridges Discord threads to OpenAI Codex CLI (`codex exec`). Single file, ~1200 lines of TypeScript (forked from [discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot) v0.8.2, then adapted for `codex-cli` 0.128+).
+[中文版](README.zh-TW.md)
 
-**Status**: v0.1.0 in development — see `CHANGELOG.md` for planned features.
+Discord bot that bridges Discord thread conversations to OpenAI Codex CLI through `codex exec`. v0.1.0 is the initial open-source release: a compact TypeScript bot with thread-scoped Codex sessions, sandboxed workdirs, role-contract dispatch commands, quota guards, and explicit Discord trust boundaries.
+
+Forked from [discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot) v0.8.2 and adapted for `codex-cli` 0.128+.
 
 For the Claude Code version, see [discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot). The two bots can run side-by-side with different mention identities (`@claude-cc` vs `@codex`).
 
-## Planned features (v0.1.0)
+## Features
 
-- **Thread sessions** — each Discord thread maps to a codex session via `codex exec --json` (session UUID parsed from first event); subsequent turns use `codex exec resume <uuid>`
-- **Per-thread sandbox** — codex's native `--sandbox workspace-write` per thread workdir; no hook-based protection layer needed
-- **Role contract dispatch** — `/codex-worker`, `/codex-verifier`, `/codex-reviewer`, `/codex-synthesizer` slash commands construct packets per `~/.claude/skills/codex-dispatch/`
-- **Quota guard** — per-user rate limit + token cap (ChatGPT subscription default; `OPENAI_API_KEY` switches to API key path)
-- **Trust boundary** — guild/channel allowlist, sensitive-path blocklist, sandbox-write scope enforced by codex
-- **AI disclosure** — first reply per session marks output as AI-generated
+- **Thread sessions** - each Discord thread maps to a Codex session. First turns run `codex exec --json`; the bot parses the `thread.started` JSONL event and stores `thread_id`. Later turns use `codex exec resume <uuid>`.
+- **Per-thread sandbox** - Codex runs with native `--sandbox workspace-write` by default, `-C <cwd>`, and an optional per-thread workdir root via `THREAD_WORKDIR_ROOT`.
+- **Role contract dispatch** - `/codex-worker`, `/codex-verifier`, `/codex-reviewer`, and `/codex-synthesizer` create codex-dispatch packets and report run artifacts back to the Discord thread.
+- **Quota guard** - per-user hourly request limits and per-channel daily token caps are stored in SQLite and enforced before Codex work starts.
+- **Trust boundary** - guild/channel/DM allowlists gate incoming messages and slash commands, while sensitive path prefixes block unsafe `cwd`, `/cd`, and role-command workdirs.
+- **AI disclosure** - the first bot reply in a session identifies the output as Codex, an AI assistant by OpenAI.
+- **Thread history and attachments** - recent thread context is included in prompts, and attachments up to 10 MB are downloaded to temporary files that Codex can read.
 
 ## Quickstart
 
@@ -28,51 +31,106 @@ npm start
 ### Prerequisites
 
 - Node.js 22+
-- [`codex-cli`](https://github.com/openai/codex) 0.128+ installed and logged in (`codex login` — ChatGPT account or API key)
+- [`codex-cli`](https://github.com/openai/codex) 0.128+ installed and logged in (`codex login` with a ChatGPT account or API key)
 - Discord bot token from [Discord Developer Portal](https://discord.com/developers/applications)
 - A C++ toolchain for building `better-sqlite3` (Xcode CLT on macOS, `build-essential` on Linux)
 
 ### Discord bot setup
 
-1. Create a new application in the Discord Developer Portal
-2. **Bot** → enable **Message Content Intent**
-3. **OAuth2** → URL Generator → select `bot` + `applications.commands`
-4. Permissions: Send Messages, Read Message History, Attach Files, Use Slash Commands
-5. Invite the bot to your server with the generated URL
+1. Create a new application in the Discord Developer Portal.
+2. **Bot** -> enable **Message Content Intent**.
+3. **OAuth2** -> URL Generator -> select `bot` + `applications.commands`.
+4. Permissions: Send Messages, Read Message History, Attach Files, Use Slash Commands.
+5. Invite the bot to your server with the generated URL.
 
-## Environment variables
+## Slash Commands
+
+General commands:
+
+- `/help` - show the built-in command list.
+- `/new` - clear the current Discord thread's Codex session so the next mention starts a new `codex exec` thread.
+- `/model <name>` - set the Codex model override for the current Discord thread.
+- `/cd <path>` - change the current Discord thread's working directory after the sensitive-path check passes.
+- `/stop` - send `SIGTERM` to the running Codex or codex-dispatch process for the current Discord thread.
+- `/sessions` - list active Discord thread sessions and their current model/workdir.
+
+Role dispatch commands:
+
+- `/codex-worker workdir:<path> objective:<text> write_scope:<csv?>` - dispatch a worker packet with an explicit write scope.
+- `/codex-verifier workdir:<path> claim:<text>` - dispatch a read-only verifier packet.
+- `/codex-reviewer workdir:<path> target:<text>` - dispatch a read-only reviewer packet.
+- `/codex-synthesizer workdir:<path> findings:<text>` - dispatch a read-only synthesizer packet.
+
+The role commands require a Git workdir and use `codex-dispatch` artifacts (`policy.json`, `result.md`, and worker `post-diff-stat.txt` when present) for Discord replies.
+
+## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DISCORD_TOKEN` | Yes | Bot token from Discord Developer Portal |
-| `GUILD_ID` | No | Server ID for instant slash command registration |
-| `DEFAULT_CWD` | No | Default working directory for codex (defaults to `process.cwd()`) |
-| `CODEX_BIN` | No | Path to codex binary (defaults to `codex`) |
+| `GUILD_ID` | No | Server ID for instant slash command registration; also the default guild allowlist when `ALLOWED_GUILD_IDS` is empty |
+| `DEFAULT_CWD` | No | Default working directory for Codex (defaults to `process.cwd()`) |
+| `CODEX_BIN` | No | Path to Codex binary (defaults to `codex`) |
 | `CODEX_SANDBOX` | No | `read-only` \| `workspace-write` \| `danger-full-access` (default `workspace-write`) |
-| `CODEX_MODEL` | No | Override codex model |
-| `OPENAI_API_KEY` | No | Switch from ChatGPT subscription auth to API key |
+| `CODEX_MODEL` | No | Default Codex model override |
+| `OPENAI_API_KEY` | No | Lets Codex use API key auth when your `codex-cli` setup supports it |
+| `ALLOWED_GUILD_IDS` | No | CSV allowlist for guild messages and slash commands; falls back to `GUILD_ID` |
+| `ALLOWED_CHANNEL_IDS` | No | CSV allowlist for channels inside allowed guilds; empty allows every channel in allowed guilds |
+| `ALLOWED_DM_USER_IDS` | No | CSV allowlist for DMs; empty rejects all DMs |
+| `SENSITIVE_PATH_BLOCKLIST` | No | CSV path-prefix blocklist for `DEFAULT_CWD`, `THREAD_WORKDIR_ROOT`, `/cd`, and role-command workdirs |
+| `THREAD_WORKDIR_ROOT` | No | Optional root where new threads get `discord-<thread_id>` workdirs |
+| `CODEX_RATE_LIMIT_PER_USER_HOUR` | No | Per-user request count per wall-clock hour bucket (default `30`) |
+| `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT` | No | Per-channel daily input-token cap from Codex usage events (default `500000`) |
+| `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT` | No | Per-channel daily output-token cap from Codex usage events (default `100000`) |
 
-## Architecture (planned)
+## Trust Boundary
 
+The bot checks Discord origin before doing work:
+
+- Guild messages and slash commands must come from `ALLOWED_GUILD_IDS` or the fallback `GUILD_ID`.
+- `ALLOWED_CHANNEL_IDS` can narrow accepted channels inside allowed guilds.
+- DMs are rejected unless the user ID is listed in `ALLOWED_DM_USER_IDS`.
+- Messages in guilds only run Codex after the bot is mentioned, and Codex work only runs inside Discord threads.
+
+Filesystem boundaries are enforced before starting Codex:
+
+- `SENSITIVE_PATH_BLOCKLIST` blocks sensitive prefixes such as `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.codex`, `${HOME}/.claude`, `/etc`, and `/root` by default.
+- The blocklist applies to `DEFAULT_CWD`, generated per-thread workdirs, `/cd`, mention-run `cwd`, and role-command `workdir`.
+- Codex itself still receives `--sandbox <CODEX_SANDBOX>`; v0.1.0 defaults to `workspace-write`.
+
+## Quota Guard
+
+Quota state is stored in the SQLite `quota` table:
+
+- User request limits use `CODEX_RATE_LIMIT_PER_USER_HOUR` and a wall-clock hour bucket.
+- Channel token caps use `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT` and `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT` with daily buckets.
+- Request quota is recorded only after successful Codex or role-dispatch exits.
+- Token quota is recorded from `turn.completed.usage` events emitted by `codex exec --json` after successful mention replies.
+
+## Architecture
+
+```text
+Discord thread          Bot (this repo)                         Codex CLI / codex-dispatch
+──────────────          ───────────────                         ─────────────────────────
+@mention msg  ────►  gate guild/channel/DM
+                     load thread session from SQLite
+                     fetch recent thread history
+                     build prompt + attachment paths
+                     spawn codex exec --json ────────────────► new session
+                                                    JSONL: thread.started { thread_id }
+                     parse JSONL agent/tool/usage events
+                     persist thread_id + last reply
+              ◄────  post final reply
+
+next mention ────►   spawn codex exec resume <uuid> --json ──► resumed session
+
+/codex-worker ──►    write role packet
+                     spawn codex-dispatch --task <packet> ───► run artifacts
+              ◄────  post result.md / policy / diff stat
 ```
-Discord thread          Bot (this repo)             Codex CLI
-──────────────          ───────────────             ─────────
-@mention msg  ────►  fetch thread history
-                     build prompt
-                     spawn codex exec --json ─────► new session (UUID)
-                                                    or resume <uuid>
-              ◄────  parse JSONL events
-                     extract session UUID
-                     persist to threads.db
-reply / .txt         post to thread     ◄────────  output-last-message
-```
 
-Single-file architecture (`src/index.ts`). SQLite-backed thread map (`threads.db`, WAL mode) — crash-safe Discord thread ID → codex session UUID.
+Single-file runtime (`src/index.ts`) with SQLite-backed thread and quota tables (`threads.db`, WAL mode). A one-time migration imports the older `thread-map.json` if it exists, then renames it to `thread-map.json.bak`.
 
 ## License
 
-MIT — see `LICENSE`.
-
-## 中文版
-
-詳見 `README.zh-TW.md`（v0.1.0 ship 時補上）。
+MIT - see `LICENSE`.
