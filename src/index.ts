@@ -122,9 +122,10 @@ function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): Thre
     if (row) {
       map[threadId] = rowToEntry(row);
     } else {
+      const cwd = cwdForNewThread(threadId, defaultCwd);
       map[threadId] = {
         sessionId: "", // codex assigns thread_id on first run; populated from JSONL thread.started event
-        cwd: defaultCwd,
+        cwd,
         model: "",
         createdAt: Date.now(),
         started: false,
@@ -218,6 +219,95 @@ function readIntegerEnv(name: string, fallback: number): number {
   if (raw === undefined || raw.trim() === "") return fallback;
   const value = Number(raw);
   return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+function readCsvEnv(name: string, fallback: string[] = []): string[] {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  return raw.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function readCsvEnvSet(name: string, fallback: string[] = []): Set<string> {
+  return new Set(readCsvEnv(name, fallback));
+}
+
+function expandHome(value: string): string {
+  return value
+    .replace(/\$\{HOME\}|\$HOME/g, HOME_DIR)
+    .replace(/^~(?=$|\/)/, HOME_DIR);
+}
+
+function normalizeOptionalPath(value: string | undefined): string {
+  return value?.trim() ? path.resolve(expandHome(value.trim())) : "";
+}
+
+function normalizeSensitivePath(value: string): string {
+  return path.resolve(expandHome(value));
+}
+
+function isBlockedPath(candidatePath: string): boolean {
+  const resolved = path.resolve(expandHome(candidatePath));
+  return SENSITIVE_PATH_BLOCKLIST.some((blockedPrefix) => {
+    const prefix = blockedPrefix.endsWith(path.sep) ? blockedPrefix : `${blockedPrefix}${path.sep}`;
+    return resolved === blockedPrefix || resolved.startsWith(prefix);
+  });
+}
+
+function cwdForNewThread(threadId: string, defaultCwd: string): string {
+  if (!THREAD_WORKDIR_ROOT) return defaultCwd;
+  const cwd = path.join(THREAD_WORKDIR_ROOT, `discord-${threadId}`);
+  if (isBlockedPath(cwd)) {
+    console.warn("[discord-codex-bot] gate denied:", {
+      reason: "thread_workdir_root_blocked",
+      threadId,
+      cwd,
+    });
+    return defaultCwd;
+  }
+  fs.mkdirSync(cwd, { recursive: true });
+  return cwd;
+}
+
+function isDiscordContextAllowed(context: {
+  guildId: string | null;
+  channelId: string;
+  userId: string;
+  source: "message" | "interaction";
+}): boolean {
+  if (!context.guildId) {
+    if (ALLOWED_DM_USER_IDS.has(context.userId)) return true;
+    console.warn("[discord-codex-bot] gate denied:", {
+      reason: "dm_user_not_allowed",
+      source: context.source,
+      channelId: context.channelId,
+      userId: context.userId,
+    });
+    return false;
+  }
+
+  if (!ALLOWED_GUILD_IDS.has(context.guildId)) {
+    console.warn("[discord-codex-bot] gate denied:", {
+      reason: "guild_not_allowed",
+      source: context.source,
+      guildId: context.guildId,
+      channelId: context.channelId,
+      userId: context.userId,
+    });
+    return false;
+  }
+
+  if (ALLOWED_CHANNEL_IDS.size > 0 && !ALLOWED_CHANNEL_IDS.has(context.channelId)) {
+    console.warn("[discord-codex-bot] gate denied:", {
+      reason: "channel_not_allowed",
+      source: context.source,
+      guildId: context.guildId,
+      channelId: context.channelId,
+      userId: context.userId,
+    });
+    return false;
+  }
+
+  return true;
 }
 
 const CODEX_RATE_LIMIT_PER_USER_HOUR = readIntegerEnv("CODEX_RATE_LIMIT_PER_USER_HOUR", 30);
@@ -636,6 +726,22 @@ const CODEX_BIN = process.env.CODEX_BIN ?? "codex";
 const CODEX_SANDBOX = process.env.CODEX_SANDBOX ?? "workspace-write";
 const CODEX_MODEL = process.env.CODEX_MODEL ?? "";
 const GUILD_ID = process.env.GUILD_ID;
+const HOME_DIR = process.env.HOME ?? "";
+const DEFAULT_SENSITIVE_PATH_BLOCKLIST = [
+  path.join(HOME_DIR, ".ssh"),
+  path.join(HOME_DIR, ".aws"),
+  path.join(HOME_DIR, ".codex"),
+  path.join(HOME_DIR, ".claude"),
+  "/etc",
+  "/root",
+];
+const THREAD_WORKDIR_ROOT = normalizeOptionalPath(process.env.THREAD_WORKDIR_ROOT);
+const ALLOWED_GUILD_IDS = readCsvEnvSet("ALLOWED_GUILD_IDS", GUILD_ID ? [GUILD_ID] : []);
+const ALLOWED_CHANNEL_IDS = readCsvEnvSet("ALLOWED_CHANNEL_IDS");
+const ALLOWED_DM_USER_IDS = readCsvEnvSet("ALLOWED_DM_USER_IDS");
+const SENSITIVE_PATH_BLOCKLIST = readCsvEnv("SENSITIVE_PATH_BLOCKLIST", DEFAULT_SENSITIVE_PATH_BLOCKLIST)
+  .map(normalizeSensitivePath)
+  .filter(Boolean);
 const CODEX_DISPATCH_BIN = "/Users/fredchu/.claude/skills/codex-dispatch/bin/codex-dispatch", CODEX_DISPATCH_PACKET_DIR = "/tmp/codex-bot-packets", CODEX_DISPATCH_TIMEOUT_MS = 30 * 60 * 1000;
 
 type CodexRole = "worker" | "verifier" | "reviewer" | "synthesizer";
@@ -916,6 +1022,18 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
+if (ALLOWED_GUILD_IDS.size === 0) {
+  console.warn("[discord-codex-bot] startup warning: ALLOWED_GUILD_IDS and GUILD_ID are empty; all guild messages are rejected.");
+}
+
+if (isBlockedPath(DEFAULT_CWD)) {
+  console.warn("[discord-codex-bot] startup warning: DEFAULT_CWD matches SENSITIVE_PATH_BLOCKLIST; codex runs will be rejected until cwd is changed.");
+}
+
+if (THREAD_WORKDIR_ROOT && isBlockedPath(THREAD_WORKDIR_ROOT)) {
+  console.warn("[discord-codex-bot] startup warning: THREAD_WORKDIR_ROOT matches SENSITIVE_PATH_BLOCKLIST; per-thread cwd creation will fall back and may be rejected.");
+}
+
 const threadMap = loadMap();
 
 const client = new Client({
@@ -965,6 +1083,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName } = interaction;
+  if (!isDiscordContextAllowed({
+    guildId: interaction.guildId,
+    channelId: interaction.channelId,
+    userId: interaction.user.id,
+    source: "interaction",
+  })) {
+    return;
+  }
 
   try {
     if (commandName === "help") {
@@ -1011,6 +1137,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (commandName === "cd") {
       const dir = interaction.options.getString("path", true);
+      if (isBlockedPath(dir)) {
+        console.warn("[discord-codex-bot] gate denied:", {
+          reason: "cd_blocked_path",
+          commandName,
+          userId: interaction.user.id,
+          path: dir,
+        });
+        await interaction.reply({ content: "Blocked path by SENSITIVE_PATH_BLOCKLIST.", ephemeral: true });
+        return;
+      }
       if (!fs.existsSync(dir)) {
         await interaction.reply({ content: `Path not found: \`${dir}\``, ephemeral: true });
         return;
@@ -1076,11 +1212,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      const opts = buildDispatchOptions(codexRole, interaction);
+      if (isBlockedPath(opts.workdir)) {
+        console.warn("[discord-codex-bot] gate denied:", {
+          reason: "role_workdir_blocked",
+          commandName,
+          userId: interaction.user.id,
+          workdir: opts.workdir,
+        });
+        await interaction.reply({ content: "Blocked workdir by SENSITIVE_PATH_BLOCKLIST.", ephemeral: true });
+        return;
+      }
+
       await interaction.deferReply({ ephemeral: true });
       const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
       const includeDisclosure = !entry.started;
       try {
-        const opts = buildDispatchOptions(codexRole, interaction);
         const result = await dispatchCodexRole(codexRole, opts);
         const responseText = formatDispatchResult(codexRole, result, includeDisclosure);
         const botReply = responseText.length <= DISCORD_MAX_LEN
@@ -1112,7 +1259,29 @@ client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot) return;
 
-    // Only respond in threads, and only when mentioned
+    if (!message.guildId) {
+      if (!isDiscordContextAllowed({
+        guildId: message.guildId,
+        channelId: message.channelId,
+        userId: message.author.id,
+        source: "message",
+      })) {
+        return;
+      }
+    } else {
+      // Only respond when mentioned, then apply the guild/channel gate before any work.
+      if (!message.mentions.has(client.user!.id)) return;
+      if (!isDiscordContextAllowed({
+        guildId: message.guildId,
+        channelId: message.channelId,
+        userId: message.author.id,
+        source: "message",
+      })) {
+        return;
+      }
+    }
+
+    // Only thread conversations can spawn Codex.
     if (!message.channel.isThread()) return;
     if (!message.mentions.has(client.user!.id)) return;
 
@@ -1122,6 +1291,16 @@ client.on(Events.MessageCreate, async (message) => {
 
     const threadId = message.channelId;
     const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+    if (isBlockedPath(entry.cwd)) {
+      console.warn("[discord-codex-bot] gate denied:", {
+        reason: "entry_cwd_blocked",
+        threadId,
+        userId: message.author.id,
+        cwd: entry.cwd,
+      });
+      await message.reply("Blocked cwd by SENSITIVE_PATH_BLOCKLIST.");
+      return;
+    }
 
     if (running.has(threadId)) {
       await message.reply("Previous task still running. Use `/stop` first.");
