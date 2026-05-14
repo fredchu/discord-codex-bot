@@ -114,9 +114,9 @@ function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): Thre
       map[threadId] = rowToEntry(row);
     } else {
       map[threadId] = {
-        sessionId: crypto.randomUUID(),
+        sessionId: "", // codex assigns thread_id on first run; populated from JSONL thread.started event
         cwd: defaultCwd,
-        model: "opus",
+        model: "",
         createdAt: Date.now(),
         started: false,
       };
@@ -343,43 +343,57 @@ type PermissionDenial = {
 
 type RunResult = { text: string; exitCode: number; costUsd?: number; permissionDenials?: PermissionDenial[] };
 
-function runClaudeStreaming(opts: {
+type CodexUsage = {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+};
+
+function runCodexStreaming(opts: {
+  threadId: string;
   sessionId: string;
   prompt: string;
   cwd: string;
   model: string;
-  claudeBin: string;
+  codexBin: string;
+  sandbox: string;
   resume: boolean;
   systemPrompt?: string;
   timeoutMs?: number;
   callbacks?: StreamCallbacks;
-}): Promise<RunResult> {
+}): Promise<RunResult & { sessionId: string; usage?: CodexUsage }> {
   return new Promise((resolve, reject) => {
-    const args = [
-      "-p", opts.prompt,
-      ...(opts.resume ? ["--resume", opts.sessionId] : ["--session-id", opts.sessionId]),
-      "--model", opts.model,
-      "--dangerously-skip-permissions",
-      "--output-format", "stream-json",
-      "--verbose",
-      "--include-partial-messages",
-      ...(opts.systemPrompt ? ["--system-prompt", opts.systemPrompt] : []),
+    const fullPrompt = opts.systemPrompt
+      ? `${opts.systemPrompt}\n\n---\n\n${opts.prompt}`
+      : opts.prompt;
+
+    const baseArgs: string[] = [
+      "exec",
+      ...(opts.resume && opts.sessionId ? ["resume", opts.sessionId] : []),
+      "--json",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--sandbox", opts.sandbox,
+      "-C", opts.cwd,
+      "--skip-git-repo-check",
+      ...(opts.model ? ["-m", opts.model] : []),
+      fullPrompt,
     ];
 
-    const child = spawn(opts.claudeBin, args, {
+    const child = spawn(opts.codexBin, baseArgs, {
       cwd: opts.cwd,
-      env: { ...process.env, CLAUDECODE: undefined },
+      env: { ...process.env },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    running.set(opts.sessionId, child);
+    running.set(opts.threadId, child);
 
     let buffer = "";
     let stderrBuf = "";
     let lastSeenText = "";
     let resultText = "";
-    let costUsd: number | undefined;
-    let permissionDenials: PermissionDenial[] | undefined;
+    let capturedSessionId = opts.sessionId;
+    let usage: CodexUsage | undefined;
     let settled = false;
 
     child.stderr.on("data", (chunk: Buffer) => {
@@ -396,27 +410,38 @@ function runClaudeStreaming(opts: {
         try {
           const event = JSON.parse(line);
 
-          if (event.type === "assistant" && event.message?.content) {
-            let messageText = "";
-            for (const block of event.message.content) {
-              if (block.type === "text") {
-                messageText += block.text || "";
-              } else if (block.type === "tool_use" && block.name) {
-                opts.callbacks?.onToolUse?.(block.name);
-              }
-            }
-            if (messageText && messageText !== lastSeenText) {
-              lastSeenText = messageText;
-              opts.callbacks?.onText?.(messageText);
-            }
+          // First line of a new (non-resume) run carries the session UUID
+          if (event.type === "thread.started" && event.thread_id) {
+            capturedSessionId = event.thread_id;
+            continue;
           }
 
-          if (event.type === "result") {
-            resultText = event.result || "";
-            costUsd = event.total_cost_usd;
-            if (event.permission_denials?.length > 0) {
-              permissionDenials = event.permission_denials;
+          if (event.type === "item.completed" && event.item?.type === "agent_message") {
+            const text: string = event.item.text || "";
+            if (text) {
+              resultText = text;
+              if (text !== lastSeenText) {
+                lastSeenText = text;
+                opts.callbacks?.onText?.(text);
+              }
             }
+            continue;
+          }
+
+          // Tool-use hints (codex emits structured items for shell/edit/etc)
+          if (event.type === "item.completed" && event.item?.type && event.item.type !== "agent_message") {
+            opts.callbacks?.onToolUse?.(event.item.type);
+            continue;
+          }
+
+          if (event.type === "turn.completed" && event.usage) {
+            usage = {
+              inputTokens: event.usage.input_tokens ?? 0,
+              cachedInputTokens: event.usage.cached_input_tokens ?? 0,
+              outputTokens: event.usage.output_tokens ?? 0,
+              reasoningOutputTokens: event.usage.reasoning_output_tokens ?? 0,
+            };
+            continue;
           }
         } catch {
           // Not valid JSON, skip
@@ -428,14 +453,15 @@ function runClaudeStreaming(opts: {
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      running.delete(opts.sessionId);
+      running.delete(opts.threadId);
       child.kill("SIGTERM");
       const partial = resultText || lastSeenText || "";
       if (partial) {
         resolve({
           text: partial + "\n\n⚠️ *Task timed out after 90 min — partial result above.*",
           exitCode: 124,
-          costUsd,
+          sessionId: capturedSessionId,
+          usage,
         });
       } else {
         reject(new Error(`Timeout after ${timeout}ms with no output`));
@@ -446,7 +472,7 @@ function runClaudeStreaming(opts: {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      running.delete(opts.sessionId);
+      running.delete(opts.threadId);
       reject(err);
     });
 
@@ -454,10 +480,15 @@ function runClaudeStreaming(opts: {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      running.delete(opts.sessionId);
+      running.delete(opts.threadId);
       const errHint = stderrBuf.trim() ? `\n\n⚠️ stderr: ${stderrBuf.trim().slice(0, 500)}` : "";
       const text = resultText || lastSeenText || `(no output)${errHint}`;
-      resolve({ text, exitCode: code ?? 1, costUsd, permissionDenials });
+      resolve({
+        text,
+        exitCode: code ?? 1,
+        sessionId: capturedSessionId,
+        usage,
+      });
     });
   });
 }
@@ -700,7 +731,9 @@ function handleStreamText(ps: PreviewState, fullText: string): void {
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN!;
 const DEFAULT_CWD = process.env.DEFAULT_CWD ?? process.cwd();
-const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
+const CODEX_BIN = process.env.CODEX_BIN ?? "codex";
+const CODEX_SANDBOX = process.env.CODEX_SANDBOX ?? "workspace-write";
+const CODEX_MODEL = process.env.CODEX_MODEL ?? "";
 const GUILD_ID = process.env.GUILD_ID;
 
 const slashCommands = [
@@ -769,21 +802,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.update({ content: `✅ **${answer}**`, components: [] });
 
-      // Resume claude with the answer
-      if (entry && !running.has(entry.sessionId)) {
+      // Resume codex with the answer
+      if (entry && !running.has(threadId)) {
         const ch = interaction.channel!;
         if (!("send" in ch)) return;
         const previewState = createPreviewState();
         previewState.msg = await ch.send("⏳ *Continuing...*");
 
         try {
-          const result = await runClaudeStreaming({
+          const result = await runCodexStreaming({
+            threadId,
             sessionId: entry.sessionId,
             prompt: `I choose: ${answer}`,
             cwd: entry.cwd,
-            model: entry.model,
-            claudeBin: CLAUDE_BIN,
-            resume: true,
+            model: entry.model || CODEX_MODEL,
+            codexBin: CODEX_BIN,
+            sandbox: CODEX_SANDBOX,
+            resume: !!entry.sessionId,
             systemPrompt: SYSTEM_PROMPT,
             callbacks: {
               onText: (fullText) => handleStreamText(previewState, fullText),
@@ -793,12 +828,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
           if (previewState.timer) clearTimeout(previewState.timer);
 
-          // Check for AskUserQuestion denials — render as Discord buttons
-          const askDenial = result.permissionDenials?.find(d => d.tool_name === "AskUserQuestion");
-          if (askDenial) {
-            await previewState.msg!.delete().catch(() => {});
-            await sendAskButtons(ch, threadId, entry, askDenial);
-            return;
+          // codex does not emit Claude-style AskUserQuestion permission denials;
+          // TODO(codex-cleanup): remove sendAskButtons + PermissionDenial type in v0.2 if not needed
+
+          if (result.sessionId && result.sessionId !== entry.sessionId) {
+            entry.sessionId = result.sessionId;
           }
 
           await previewState.msg!.delete().catch(() => {});
@@ -809,7 +843,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             botReply = await sendChunked(ch, result.text);
           }
           entry.lastBotMessageId = botReply.id;
-          patchSessionEntrypoint(entry.sessionId, entry.cwd);
+          // TODO(codex-cleanup): patchSessionEntrypoint is claude-specific, remove in v0.2
           saveEntry(threadId, entry);
         } catch (err) {
           if (previewState.timer) clearTimeout(previewState.timer);
@@ -889,7 +923,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const threadId = interaction.channelId;
       const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
-      entry.sessionId = crypto.randomUUID();
+      entry.sessionId = ""; // codex assigns thread_id on next run
       entry.started = false;
       saveEntry(threadId, entry);
       await interaction.reply({ content: "Context cleared. Next message starts a new conversation.", ephemeral: true });
@@ -935,8 +969,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const threadId = interaction.channelId;
       const entry = threadMap[threadId];
-      if (entry && running.has(entry.sessionId)) {
-        running.get(entry.sessionId)!.kill("SIGTERM");
+      if (entry && running.has(threadId)) {
+        running.get(threadId)!.kill("SIGTERM");
         await interaction.reply({ content: "Stopped.", ephemeral: true });
       } else {
         await interaction.reply({ content: "Nothing running.", ephemeral: true });
@@ -1054,12 +1088,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       // Kill any running process
-      if (running.has(entry.sessionId)) {
-        running.get(entry.sessionId)!.kill("SIGTERM");
+      if (running.has(threadId)) {
+        running.get(threadId)!.kill("SIGTERM");
       }
       // Reset to a fresh bot session
       entry.isLocalResume = false;
-      entry.sessionId = crypto.randomUUID();
+      entry.sessionId = ""; // codex assigns thread_id on next run
       entry.started = false;
       saveEntry(threadId, entry);
       await interaction.reply(
@@ -1091,7 +1125,7 @@ client.on(Events.MessageCreate, async (message) => {
     const threadId = message.channelId;
     const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
 
-    if (running.has(entry.sessionId)) {
+    if (running.has(threadId)) {
       await message.reply("Previous task still running. Use `/stop` first.");
       return;
     }
@@ -1100,7 +1134,7 @@ client.on(Events.MessageCreate, async (message) => {
     const previewState = createPreviewState();
     previewState.msg = await message.reply("⏳ *Thinking...*");
 
-    // Download all attachments — let Claude Code handle them via Read tool
+    // Download all attachments — let codex read them via fs once cwd is workspace-write
     const filePaths: string[] = [];
     for (const att of attachments) {
       if (att.size > ATTACH_MAX_BYTES) {
@@ -1127,13 +1161,15 @@ client.on(Events.MessageCreate, async (message) => {
       }
       const prompt = history ? `${history}${userMessage}` : userMessage;
 
-      const result = await runClaudeStreaming({
+      const result = await runCodexStreaming({
+        threadId,
         sessionId: entry.sessionId,
         prompt,
         cwd: entry.cwd,
-        model: entry.model,
-        claudeBin: CLAUDE_BIN,
-        resume: entry.started,
+        model: entry.model || CODEX_MODEL,
+        codexBin: CODEX_BIN,
+        sandbox: CODEX_SANDBOX,
+        resume: entry.started && !!entry.sessionId,
         systemPrompt: entry.isLocalResume ? RESUME_SYSTEM_PROMPT : SYSTEM_PROMPT,
         callbacks: {
           onText: (fullText) => handleStreamText(previewState, fullText),
@@ -1144,13 +1180,12 @@ client.on(Events.MessageCreate, async (message) => {
       // Cancel any pending throttle timer
       if (previewState.timer) clearTimeout(previewState.timer);
 
-      // Check for AskUserQuestion denials — render as Discord buttons
-      const askDenial = result.permissionDenials?.find(d => d.tool_name === "AskUserQuestion");
-      if (askDenial) {
-        await previewState.msg!.delete().catch(() => {});
-        entry.started = true;
-        await sendAskButtons(message.channel, threadId, entry, askDenial);
-        return; // Wait for button click — handler will resume
+      // codex does not emit AskUserQuestion-style permission denials;
+      // TODO(codex-cleanup): remove sendAskButtons + AskQuestion / PermissionDenial types in v0.2.
+
+      // Persist codex-assigned session UUID after first run (or if it changed)
+      if (result.sessionId && result.sessionId !== entry.sessionId) {
+        entry.sessionId = result.sessionId;
       }
 
       const isFirstReply = !entry.started;
@@ -1159,7 +1194,7 @@ client.on(Events.MessageCreate, async (message) => {
       }
 
       const disclosure = (isFirstReply && !entry.isLocalResume)
-        ? "*I'm Claude, an AI assistant by Anthropic.*\n\n"
+        ? "*I'm Codex, an AI assistant by OpenAI.*\n\n"
         : "";
       const responseText = `${disclosure}${result.text}`;
 
@@ -1174,12 +1209,12 @@ client.on(Events.MessageCreate, async (message) => {
           botReply = await sendChunked(message.channel, responseText, message);
         }
       } catch (replyErr) {
-        console.error("[discord-cc-bot] reply failed, trying fallback:", (replyErr as Error).message);
+        console.error("[discord-codex-bot] reply failed, trying fallback:", (replyErr as Error).message);
         botReply = await message.channel.send(responseText.slice(0, DISCORD_MAX_LEN));
       }
 
       entry.lastBotMessageId = botReply.id;
-      patchSessionEntrypoint(entry.sessionId, entry.cwd);
+      // TODO(codex-cleanup): patchSessionEntrypoint is claude-specific, remove in v0.2
       saveEntry(threadId, entry);
     } catch (err) {
       if (previewState.timer) clearTimeout(previewState.timer);
