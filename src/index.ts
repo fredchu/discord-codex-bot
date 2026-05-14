@@ -383,7 +383,6 @@ function runCodexStreaming(opts: {
   cwd: string;
   model: string;
   codexBin: string;
-  sandbox: string;
   resume: boolean;
   systemPrompt?: string;
   timeoutMs?: number;
@@ -394,12 +393,14 @@ function runCodexStreaming(opts: {
       ? `${opts.systemPrompt}\n\n---\n\n${opts.prompt}`
       : opts.prompt;
 
+    // --dangerously-bypass-approvals-and-sandbox both skips approvals AND disables
+    // codex's built-in sandbox; do NOT also pass --sandbox (codex exec resume rejects it
+    // as an unexpected argument, and on a new run the two flags are redundant).
     const baseArgs: string[] = [
       "exec",
       ...(opts.resume && opts.sessionId ? ["resume", opts.sessionId] : []),
       "--json",
       "--dangerously-bypass-approvals-and-sandbox",
-      "--sandbox", opts.sandbox,
       "-C", opts.cwd,
       "--skip-git-repo-check",
       ...(opts.model ? ["-m", opts.model] : []),
@@ -723,7 +724,6 @@ function handleStreamText(ps: PreviewState, fullText: string): void {
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN!;
 const DEFAULT_CWD = process.env.DEFAULT_CWD ?? process.cwd();
 const CODEX_BIN = process.env.CODEX_BIN ?? "codex";
-const CODEX_SANDBOX = process.env.CODEX_SANDBOX ?? "workspace-write";
 const CODEX_MODEL = process.env.CODEX_MODEL ?? "";
 const GUILD_ID = process.env.GUILD_ID;
 const HOME_DIR = process.env.HOME ?? "";
@@ -1355,7 +1355,6 @@ client.on(Events.MessageCreate, async (message) => {
         cwd: entry.cwd,
         model: entry.model || CODEX_MODEL,
         codexBin: CODEX_BIN,
-        sandbox: CODEX_SANDBOX,
         resume: entry.started && !!entry.sessionId,
         systemPrompt: SYSTEM_PROMPT,
         callbacks: {
