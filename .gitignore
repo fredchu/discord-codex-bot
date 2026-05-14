@@ -40,3 +40,6 @@ $RECYCLE.BIN/
 # Logs
 *.log
 npm-debug.log*
+
+# codex-dispatch worker artifacts
+.codex-dispatch/
