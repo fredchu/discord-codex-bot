@@ -13,7 +13,7 @@ For the Claude Code version, see [discord-claude-code-bot](https://github.com/fr
 - **Thread sessions** - each Discord thread maps to a Codex session. First turns run `codex exec --json`; the bot parses the `thread.started` JSONL event and stores `thread_id`. Later turns use `codex exec resume <uuid>`.
 - **Per-thread sandbox** - Codex runs with native `--sandbox workspace-write` by default, `-C <cwd>`, and an optional per-thread workdir root via `THREAD_WORKDIR_ROOT`.
 - **Role contract dispatch** - `/codex-worker`, `/codex-verifier`, `/codex-reviewer`, and `/codex-synthesizer` create codex-dispatch packets and report run artifacts back to the Discord thread.
-- **Quota guard** - per-user hourly request limits and per-channel daily token caps are stored in SQLite and enforced before Codex work starts.
+- **Quota guard** - per-user hourly request limits are stored in SQLite and enforced before Codex work starts.
 - **Trust boundary** - guild/channel/DM allowlists gate incoming messages and slash commands, while sensitive path prefixes block unsafe `cwd`, `/cd`, and role-command workdirs.
 - **AI disclosure** - the first bot reply in a session identifies the output as Codex, an AI assistant by OpenAI.
 - **Thread history and attachments** - recent thread context is included in prompts, and attachments up to 10 MB are downloaded to temporary files that Codex can read.
@@ -80,8 +80,6 @@ The role commands require a Git workdir and use `codex-dispatch` artifacts (`pol
 | `SENSITIVE_PATH_BLOCKLIST` | No | CSV path-prefix blocklist for `DEFAULT_CWD`, `THREAD_WORKDIR_ROOT`, `/cd`, and role-command workdirs |
 | `THREAD_WORKDIR_ROOT` | No | Optional root where new threads get `discord-<thread_id>` workdirs |
 | `CODEX_RATE_LIMIT_PER_USER_HOUR` | No | Per-user request count per wall-clock hour bucket (default `30`) |
-| `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT` | No | Per-channel daily input-token cap from Codex usage events (default `500000`) |
-| `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT` | No | Per-channel daily output-token cap from Codex usage events (default `100000`) |
 
 ## Trust Boundary
 
@@ -103,9 +101,7 @@ Filesystem boundaries are enforced before starting Codex:
 Quota state is stored in the SQLite `quota` table:
 
 - User request limits use `CODEX_RATE_LIMIT_PER_USER_HOUR` and a wall-clock hour bucket.
-- Channel token caps use `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT` and `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT` with daily buckets.
 - Request quota is recorded only after successful Codex or role-dispatch exits.
-- Token quota is recorded from `turn.completed.usage` events emitted by `codex exec --json` after successful mention replies.
 
 ## Architecture
 

@@ -311,21 +311,12 @@ function isDiscordContextAllowed(context: {
 }
 
 const CODEX_RATE_LIMIT_PER_USER_HOUR = readIntegerEnv("CODEX_RATE_LIMIT_PER_USER_HOUR", 30);
-const CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT = readIntegerEnv("CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT", 500_000);
-const CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT = readIntegerEnv("CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT", 100_000);
 
 const HOUR_MS = 60 * 60 * 1000;
-const DAY_MS = 24 * HOUR_MS;
 const REQUESTS_HOUR_BUCKET = "requests_hour";
-const TOKENS_DAY_INPUT_BUCKET = "tokens_day_input";
-const TOKENS_DAY_OUTPUT_BUCKET = "tokens_day_output";
 
 function currentHourStart(now = Date.now()): number {
   return Math.floor(now / HOUR_MS) * HOUR_MS;
-}
-
-function currentDayStart(now = Date.now()): number {
-  return Math.floor(now / DAY_MS) * DAY_MS;
 }
 
 function readQuotaCount(scope: string, scopeId: string, bucketKey: string, bucketStart: number): number {
@@ -343,37 +334,13 @@ function checkUserRateLimit(userId: string): { allowed: boolean; remaining: numb
   };
 }
 
-function checkChannelTokenCap(channelId: string): { allowed: boolean; usedInput: number; usedOutput: number; capInput: number; capOutput: number; } {
-  const bucketStart = currentDayStart();
-  const usedInput = readQuotaCount("channel", channelId, TOKENS_DAY_INPUT_BUCKET, bucketStart);
-  const usedOutput = readQuotaCount("channel", channelId, TOKENS_DAY_OUTPUT_BUCKET, bucketStart);
-  return {
-    allowed: usedInput < CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT && usedOutput < CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT,
-    usedInput,
-    usedOutput,
-    capInput: CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT,
-    capOutput: CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT,
-  };
-}
-
 function recordUserRequest(userId: string): void {
   stmtAddQuota.run("user", userId, REQUESTS_HOUR_BUCKET, currentHourStart(), 1);
-}
-
-function recordChannelTokens(channelId: string, usage: CodexUsage): void {
-  const bucketStart = currentDayStart();
-  // Store input and output token totals as separate daily rows so each cap can be checked independently.
-  stmtAddQuota.run("channel", channelId, TOKENS_DAY_INPUT_BUCKET, bucketStart, usage.inputTokens);
-  stmtAddQuota.run("channel", channelId, TOKENS_DAY_OUTPUT_BUCKET, bucketStart, usage.outputTokens);
 }
 
 function formatUserRateLimitHit(userId: string, limit: ReturnType<typeof checkUserRateLimit>): string {
   const used = CODEX_RATE_LIMIT_PER_USER_HOUR - limit.remaining;
   return `⚠️ Rate limit: ${userId} has used ${used}/${CODEX_RATE_LIMIT_PER_USER_HOUR} requests this hour. Try again at ${new Date(limit.resetAt).toISOString()}.`;
-}
-
-function formatChannelTokenCapHit(limit: ReturnType<typeof checkChannelTokenCap>): string {
-  return `⚠️ Channel token cap reached: ${limit.usedInput}/${limit.capInput} input tokens or ${limit.usedOutput}/${limit.capOutput} output tokens used today.`;
 }
 
 function runCodexStreaming(opts: {
@@ -1214,11 +1181,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: formatUserRateLimitHit(interaction.user.id, userLimit), ephemeral: true });
         return;
       }
-      const channelLimit = checkChannelTokenCap(threadId);
-      if (!channelLimit.allowed) {
-        await interaction.reply({ content: formatChannelTokenCapHit(channelLimit), ephemeral: true });
-        return;
-      }
 
       const opts = buildDispatchOptions(codexRole, interaction);
       if (isBlockedPath(opts.workdir)) {
@@ -1319,11 +1281,6 @@ client.on(Events.MessageCreate, async (message) => {
       await message.reply(formatUserRateLimitHit(message.author.id, userLimit));
       return;
     }
-    const channelLimit = checkChannelTokenCap(threadId);
-    if (!channelLimit.allowed) {
-      await message.reply(formatChannelTokenCapHit(channelLimit));
-      return;
-    }
 
     // Send initial preview message
     const previewState = createPreviewState();
@@ -1406,7 +1363,6 @@ client.on(Events.MessageCreate, async (message) => {
       saveEntry(threadId, entry);
       if (result.exitCode === 0) {
         recordUserRequest(message.author.id);
-        if (result.usage) recordChannelTokens(threadId, result.usage);
       }
     } catch (err) {
       if (previewState.timer) clearTimeout(previewState.timer);

@@ -13,7 +13,7 @@ Claude Code 版本請見 [discord-claude-code-bot](https://github.com/fredchu/di
 - **Thread sessions** - 每個 Discord thread 對應一個 Codex session。第一次執行使用 `codex exec --json`；bot 會解析 `thread.started` JSONL event 並保存 `thread_id`。後續回合使用 `codex exec resume <uuid>`。
 - **Per-thread sandbox** - Codex 預設使用 native `--sandbox workspace-write`、`-C <cwd>`，也可以透過 `THREAD_WORKDIR_ROOT` 建立每個 thread 專屬 workdir。
 - **Role contract dispatch** - `/codex-worker`、`/codex-verifier`、`/codex-reviewer`、`/codex-synthesizer` 會建立 codex-dispatch packet，並把 run artifact 回報到 Discord thread。
-- **Quota guard** - 每使用者每小時 request limit，以及每 channel 每日 token cap，都存於 SQLite，並在 Codex 工作開始前檢查。
+- **Quota guard** - 每使用者每小時 request limit 存於 SQLite，並在 Codex 工作開始前檢查。
 - **Trust boundary** - guild/channel/DM allowlist 會 gate incoming messages 與 slash commands；sensitive path prefix 會阻擋不安全的 `cwd`、`/cd` 與 role-command workdir。
 - **AI disclosure** - 每個 session 的第一則 bot 回覆會標明輸出來自 Codex，也就是 OpenAI 的 AI assistant。
 - **Thread history and attachments** - prompt 會包含最近的 thread context；10 MB 以內的 attachment 會下載成暫存檔，讓 Codex 可以讀取。
@@ -80,8 +80,6 @@ Role commands 需要 Git workdir，並使用 `codex-dispatch` artifact（`policy
 | `SENSITIVE_PATH_BLOCKLIST` | No | 套用於 `DEFAULT_CWD`、`THREAD_WORKDIR_ROOT`、`/cd` 與 role-command workdirs 的 CSV path-prefix blocklist |
 | `THREAD_WORKDIR_ROOT` | No | Optional root；新的 threads 會取得 `discord-<thread_id>` workdirs |
 | `CODEX_RATE_LIMIT_PER_USER_HOUR` | No | 每使用者在 wall-clock hour bucket 內的 request count（預設 `30`） |
-| `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT` | No | 依 Codex usage events 統計的每 channel 每日 input-token cap（預設 `500000`） |
-| `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT` | No | 依 Codex usage events 統計的每 channel 每日 output-token cap（預設 `100000`） |
 
 ## Trust Boundary
 
@@ -103,9 +101,7 @@ Filesystem boundary 會在啟動 Codex 前檢查：
 Quota state 存在 SQLite 的 `quota` table：
 
 - User request limits 使用 `CODEX_RATE_LIMIT_PER_USER_HOUR` 與 wall-clock hour bucket。
-- Channel token caps 使用 `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT`、`CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT` 與 daily buckets。
 - Request quota 只會在 Codex 或 role-dispatch 成功退出後記錄。
-- Token quota 來自 `codex exec --json` 在 successful mention replies 後送出的 `turn.completed.usage` events。
 
 ## Architecture
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+
+- **Per-channel daily token caps**: dropped `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT` / `CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT`, the `checkChannelTokenCap` / `recordChannelTokens` paths, and their SQLite daily token buckets. Per-user hourly request rate limit (`CODEX_RATE_LIMIT_PER_USER_HOUR`) is unchanged.
+
 ## 0.1.0 - 2026-05-14
 
 Initial open-source release of `discord-codex-bot`, forked from [discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot) v0.8.2 and adapted for OpenAI Codex CLI 0.128+.
