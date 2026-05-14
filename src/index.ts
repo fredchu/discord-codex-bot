@@ -37,6 +37,15 @@ db.exec(`CREATE TABLE IF NOT EXISTS threads (
   lastBotMessageId TEXT
 )`);
 
+db.exec(`CREATE TABLE IF NOT EXISTS quota (
+  scope TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  bucket_key TEXT NOT NULL,
+  bucket_start INTEGER NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (scope, scope_id, bucket_key, bucket_start)
+)`);
+
 // One-time migration from JSON → SQLite
 if (fs.existsSync(JSON_PATH)) {
   try {
@@ -65,6 +74,16 @@ const stmtUpsert = db.prepare(
    VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId)`,
 );
 const stmtAll = db.prepare("SELECT * FROM threads");
+const stmtGetQuota = db.prepare(
+  `SELECT count FROM quota
+   WHERE scope = ? AND scope_id = ? AND bucket_key = ? AND bucket_start = ?`,
+);
+const stmtAddQuota = db.prepare(
+  `INSERT INTO quota (scope, scope_id, bucket_key, bucket_start, count)
+   VALUES (?, ?, ?, ?, ?)
+   ON CONFLICT(scope, scope_id, bucket_key, bucket_start)
+   DO UPDATE SET count = count + excluded.count`,
+);
 
 function rowToEntry(row: any): ThreadEntry {
   return {
@@ -193,6 +212,79 @@ type CodexUsage = {
   outputTokens: number;
   reasoningOutputTokens: number;
 };
+
+function readIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+const CODEX_RATE_LIMIT_PER_USER_HOUR = readIntegerEnv("CODEX_RATE_LIMIT_PER_USER_HOUR", 30);
+const CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT = readIntegerEnv("CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT", 500_000);
+const CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT = readIntegerEnv("CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT", 100_000);
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const REQUESTS_HOUR_BUCKET = "requests_hour";
+const TOKENS_DAY_INPUT_BUCKET = "tokens_day_input";
+const TOKENS_DAY_OUTPUT_BUCKET = "tokens_day_output";
+
+function currentHourStart(now = Date.now()): number {
+  return Math.floor(now / HOUR_MS) * HOUR_MS;
+}
+
+function currentDayStart(now = Date.now()): number {
+  return Math.floor(now / DAY_MS) * DAY_MS;
+}
+
+function readQuotaCount(scope: string, scopeId: string, bucketKey: string, bucketStart: number): number {
+  const row = stmtGetQuota.get(scope, scopeId, bucketKey, bucketStart) as { count: number } | undefined;
+  return row?.count ?? 0;
+}
+
+function checkUserRateLimit(userId: string): { allowed: boolean; remaining: number; resetAt: number; } {
+  const bucketStart = currentHourStart();
+  const count = readQuotaCount("user", userId, REQUESTS_HOUR_BUCKET, bucketStart);
+  return {
+    allowed: count < CODEX_RATE_LIMIT_PER_USER_HOUR,
+    remaining: Math.max(CODEX_RATE_LIMIT_PER_USER_HOUR - count, 0),
+    resetAt: bucketStart + HOUR_MS,
+  };
+}
+
+function checkChannelTokenCap(channelId: string): { allowed: boolean; usedInput: number; usedOutput: number; capInput: number; capOutput: number; } {
+  const bucketStart = currentDayStart();
+  const usedInput = readQuotaCount("channel", channelId, TOKENS_DAY_INPUT_BUCKET, bucketStart);
+  const usedOutput = readQuotaCount("channel", channelId, TOKENS_DAY_OUTPUT_BUCKET, bucketStart);
+  return {
+    allowed: usedInput < CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT && usedOutput < CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT,
+    usedInput,
+    usedOutput,
+    capInput: CODEX_TOKEN_CAP_PER_CHANNEL_DAY_INPUT,
+    capOutput: CODEX_TOKEN_CAP_PER_CHANNEL_DAY_OUTPUT,
+  };
+}
+
+function recordUserRequest(userId: string): void {
+  stmtAddQuota.run("user", userId, REQUESTS_HOUR_BUCKET, currentHourStart(), 1);
+}
+
+function recordChannelTokens(channelId: string, usage: CodexUsage): void {
+  const bucketStart = currentDayStart();
+  // Store input and output token totals as separate daily rows so each cap can be checked independently.
+  stmtAddQuota.run("channel", channelId, TOKENS_DAY_INPUT_BUCKET, bucketStart, usage.inputTokens);
+  stmtAddQuota.run("channel", channelId, TOKENS_DAY_OUTPUT_BUCKET, bucketStart, usage.outputTokens);
+}
+
+function formatUserRateLimitHit(userId: string, limit: ReturnType<typeof checkUserRateLimit>): string {
+  const used = CODEX_RATE_LIMIT_PER_USER_HOUR - limit.remaining;
+  return `⚠️ Rate limit: ${userId} has used ${used}/${CODEX_RATE_LIMIT_PER_USER_HOUR} requests this hour. Try again at ${new Date(limit.resetAt).toISOString()}.`;
+}
+
+function formatChannelTokenCapHit(limit: ReturnType<typeof checkChannelTokenCap>): string {
+  return `⚠️ Channel token cap reached: ${limit.usedInput}/${limit.capInput} input tokens or ${limit.usedOutput}/${limit.capOutput} output tokens used today.`;
+}
 
 function runCodexStreaming(opts: {
   threadId: string;
@@ -973,6 +1065,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: "Previous task still running. Use `/stop` first.", ephemeral: true });
         return;
       }
+      const userLimit = checkUserRateLimit(interaction.user.id);
+      if (!userLimit.allowed) {
+        await interaction.reply({ content: formatUserRateLimitHit(interaction.user.id, userLimit), ephemeral: true });
+        return;
+      }
+      const channelLimit = checkChannelTokenCap(threadId);
+      if (!channelLimit.allowed) {
+        await interaction.reply({ content: formatChannelTokenCapHit(channelLimit), ephemeral: true });
+        return;
+      }
 
       await interaction.deferReply({ ephemeral: true });
       const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
@@ -988,6 +1090,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         entry.lastBotMessageId = botReply.id;
         saveEntry(threadId, entry);
         await interaction.editReply(`codex-${codexRole} finished: \`${path.basename(result.runDir)}\``).catch(() => {});
+        if (result.exitCode === 0) recordUserRequest(interaction.user.id);
       } catch (err) {
         const errorText = formatDispatchError(codexRole, err);
         await sendChunked(interaction.channel, errorText).catch(() => {});
@@ -1022,6 +1125,16 @@ client.on(Events.MessageCreate, async (message) => {
 
     if (running.has(threadId)) {
       await message.reply("Previous task still running. Use `/stop` first.");
+      return;
+    }
+    const userLimit = checkUserRateLimit(message.author.id);
+    if (!userLimit.allowed) {
+      await message.reply(formatUserRateLimitHit(message.author.id, userLimit));
+      return;
+    }
+    const channelLimit = checkChannelTokenCap(threadId);
+    if (!channelLimit.allowed) {
+      await message.reply(formatChannelTokenCapHit(channelLimit));
       return;
     }
 
@@ -1105,6 +1218,10 @@ client.on(Events.MessageCreate, async (message) => {
 
       entry.lastBotMessageId = botReply.id;
       saveEntry(threadId, entry);
+      if (result.exitCode === 0) {
+        recordUserRequest(message.author.id);
+        if (result.usage) recordChannelTokens(threadId, result.usage);
+      }
     } catch (err) {
       if (previewState.timer) clearTimeout(previewState.timer);
       if (previewState.msg) {
