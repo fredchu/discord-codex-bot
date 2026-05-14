@@ -544,6 +544,265 @@ const CODEX_BIN = process.env.CODEX_BIN ?? "codex";
 const CODEX_SANDBOX = process.env.CODEX_SANDBOX ?? "workspace-write";
 const CODEX_MODEL = process.env.CODEX_MODEL ?? "";
 const GUILD_ID = process.env.GUILD_ID;
+const CODEX_DISPATCH_BIN = "/Users/fredchu/.claude/skills/codex-dispatch/bin/codex-dispatch", CODEX_DISPATCH_PACKET_DIR = "/tmp/codex-bot-packets", CODEX_DISPATCH_TIMEOUT_MS = 30 * 60 * 1000;
+
+type CodexRole = "worker" | "verifier" | "reviewer" | "synthesizer";
+
+type DispatchCodexRoleOptions = {
+  threadId: string;
+  workdir: string;
+  objective: string;
+  writeScope?: string[];
+};
+
+type DispatchCodexRoleResult = {
+  resultMd: string;
+  diffStat: string;
+  policyViolation: boolean;
+  runDir: string;
+  exitCode: number;
+  stderrTail: string;
+};
+
+class DispatchCodexRoleError extends Error {
+  constructor(message: string, public stderrTail = "") {
+    super(message);
+  }
+}
+
+const READ_ONLY_DISPATCH_NON_GOALS = ["Read-only mode: do not modify files.", "Do not make unrelated changes."];
+const DISPATCH_DEFAULTS: Record<CodexRole, { nonGoals: string[]; verification: string[]; deliverable: string }> = {
+  worker: {
+    nonGoals: ["Do not modify files outside WRITE SCOPE.", "Do not make unrelated refactors."],
+    verification: ["Run the smallest relevant checks and cite command evidence."],
+    deliverable: "Implement the requested change, verify it, and summarize changed files and evidence.",
+  },
+  verifier: {
+    nonGoals: READ_ONLY_DISPATCH_NON_GOALS,
+    verification: ["Gather fresh command evidence for the claim."],
+    deliverable: "Return a concise verification verdict with command evidence.",
+  },
+  reviewer: {
+    nonGoals: READ_ONLY_DISPATCH_NON_GOALS,
+    verification: ["Inspect the target and cite concrete file, line, or command evidence."],
+    deliverable: "Return findings first, ordered by severity, with file/line references when possible.",
+  },
+  synthesizer: {
+    nonGoals: READ_ONLY_DISPATCH_NON_GOALS,
+    verification: ["Compare the supplied findings and preserve unresolved disagreements."],
+    deliverable: "Return a concise synthesis of agreed facts, disagreements, risks, and next actions.",
+  },
+};
+
+const CODEX_ROLE_COMMANDS: Record<string, CodexRole> = {
+  "codex-worker": "worker",
+  "codex-verifier": "verifier",
+  "codex-reviewer": "reviewer",
+  "codex-synthesizer": "synthesizer",
+};
+
+function ensureGitWorkdir(workdir: string): void {
+  if (!fs.existsSync(workdir) || !fs.statSync(workdir).isDirectory()) {
+    throw new DispatchCodexRoleError(`workdir not found: ${workdir}`);
+  }
+  if (!fs.existsSync(path.join(workdir, ".git"))) {
+    throw new DispatchCodexRoleError(`workdir is not a git repository: ${workdir}`);
+  }
+}
+
+function oneLine(value: string): string { return value.replace(/\s+/g, " ").trim(); }
+
+function packetList(items: string[]): string { return items.length ? items.map((item) => `- ${item}`).join("\n") : "- none"; }
+
+function writeCodexRolePacket(role: CodexRole, opts: DispatchCodexRoleOptions): string {
+  fs.mkdirSync(CODEX_DISPATCH_PACKET_DIR, { recursive: true });
+  const unixTs = Math.floor(Date.now() / 1000);
+  const packetPath = path.join(CODEX_DISPATCH_PACKET_DIR, `${opts.threadId}-${role}-${unixTs}.md`);
+  const writeScope = role === "worker" ? (opts.writeScope?.length ? opts.writeScope : ["none"]) : ["none"];
+  const defaults = DISPATCH_DEFAULTS[role];
+  const packet = [
+    `MODE: ${role}`,
+    `WORKDIR: ${opts.workdir}`,
+    `OBJECTIVE: ${oneLine(opts.objective)}`,
+    "WRITE SCOPE:",
+    packetList(writeScope),
+    "NON-GOALS:",
+    packetList(defaults.nonGoals),
+    "VERIFICATION:",
+    packetList(defaults.verification),
+    `DELIVERABLE: ${oneLine(defaults.deliverable)}`,
+    "",
+  ].join("\n");
+  fs.writeFileSync(packetPath, packet, "utf8");
+  return packetPath;
+}
+
+function stderrTail(stderr: string): string {
+  return stderr.trim().slice(-500);
+}
+
+function parseRunDirFromStdout(stdout: string): string | null {
+  const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const line of lines.reverse()) {
+    if (line.includes("/.codex-dispatch/runs/") && fs.existsSync(line)) {
+      return line;
+    }
+  }
+  return null;
+}
+
+function newestRunDirSince(workdir: string, startedAt: number): string | null {
+  const runsDir = path.join(workdir, ".codex-dispatch", "runs");
+  if (!fs.existsSync(runsDir)) return null;
+  const dirs = fs.readdirSync(runsDir)
+    .map((name) => path.join(runsDir, name))
+    .filter((dir) => fs.existsSync(dir) && fs.statSync(dir).isDirectory())
+    .map((dir) => ({ dir, mtimeMs: fs.statSync(dir).mtimeMs }))
+    .filter((entry) => entry.mtimeMs >= startedAt - 1000)
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return dirs[0]?.dir ?? null;
+}
+
+function readRequiredArtifact(runDir: string, filename: string): string {
+  const artifactPath = path.join(runDir, filename);
+  if (!fs.existsSync(artifactPath)) {
+    throw new DispatchCodexRoleError(`missing dispatch artifact: ${artifactPath}`);
+  }
+  return fs.readFileSync(artifactPath, "utf8");
+}
+
+function policyViolationFromJson(policyText: string): boolean {
+  try {
+    const policy = JSON.parse(policyText) as { policy_violation?: unknown; violation?: unknown };
+    return policy.policy_violation === true || policy.violation === true;
+  } catch {
+    return true;
+  }
+}
+
+function runDispatchProcess(threadId: string, workdir: string, packetPath: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(CODEX_DISPATCH_BIN, ["--task", packetPath], {
+      cwd: workdir,
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    running.set(threadId, child);
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      running.delete(threadId);
+      child.kill("SIGTERM");
+      reject(new DispatchCodexRoleError("codex-dispatch timed out after 30 minutes", stderrTail(stderr)));
+    }, CODEX_DISPATCH_TIMEOUT_MS);
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      running.delete(threadId);
+      reject(new DispatchCodexRoleError(err.message, stderrTail(stderr)));
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      running.delete(threadId);
+      resolve({ stdout, stderr, exitCode: code ?? 1 });
+    });
+  });
+}
+
+async function dispatchCodexRole(role: CodexRole, opts: DispatchCodexRoleOptions): Promise<DispatchCodexRoleResult> {
+  ensureGitWorkdir(opts.workdir);
+  const startedAt = Date.now();
+  const packetPath = writeCodexRolePacket(role, opts);
+  const { stdout, stderr, exitCode } = await runDispatchProcess(opts.threadId, opts.workdir, packetPath);
+  const runDir = parseRunDirFromStdout(stdout) ?? newestRunDirSince(opts.workdir, startedAt);
+  if (!runDir) {
+    throw new DispatchCodexRoleError(`codex-dispatch exited ${exitCode} without a run_dir`, stderrTail(stderr));
+  }
+
+  const policyText = readRequiredArtifact(runDir, "policy.json");
+  const resultMd = readRequiredArtifact(runDir, "result.md");
+  const diffStat = fs.existsSync(path.join(runDir, "post-diff-stat.txt"))
+    ? fs.readFileSync(path.join(runDir, "post-diff-stat.txt"), "utf8")
+    : "";
+  return {
+    resultMd,
+    diffStat,
+    policyViolation: policyViolationFromJson(policyText),
+    runDir,
+    exitCode,
+    stderrTail: stderrTail(stderr),
+  };
+}
+
+function parseCsvPaths(csv: string | null): string[] { return (csv ?? "").split(",").map((item) => item.trim()).filter(Boolean); }
+
+function roleFromCommand(commandName: string): CodexRole | null {
+  return CODEX_ROLE_COMMANDS[commandName] ?? null;
+}
+
+function buildDispatchOptions(role: CodexRole, interaction: { channelId: string; options: any }): DispatchCodexRoleOptions {
+  const threadId = interaction.channelId;
+  const workdir = interaction.options.getString("workdir", true);
+  if (role === "worker") {
+    return {
+      threadId,
+      workdir,
+      objective: interaction.options.getString("objective", true),
+      writeScope: parseCsvPaths(interaction.options.getString("write_scope")),
+    };
+  }
+  if (role === "verifier") {
+    const claim = interaction.options.getString("claim", true);
+    return { threadId, workdir, objective: `Verify claim: ${claim}` };
+  }
+  if (role === "reviewer") {
+    const target = interaction.options.getString("target", true);
+    return { threadId, workdir, objective: `Review target: ${target}` };
+  }
+  const findings = interaction.options.getString("findings", true);
+  return { threadId, workdir, objective: `Synthesize findings: ${findings}` };
+}
+
+function formatDispatchResult(role: CodexRole, result: DispatchCodexRoleResult, includeDisclosure: boolean): string {
+  const runId = path.basename(result.runDir);
+  const lines = [
+    includeDisclosure ? "*I'm Codex, an AI assistant by OpenAI.*\n" : "",
+    `**codex-${role}** \`${runId}\``,
+    `policy_violation: \`${result.policyViolation ? "true" : "false"}\``,
+    `exit_code: \`${result.exitCode}\``,
+  ];
+  if (result.exitCode !== 0) {
+    lines.push(`dispatch_error: \`codex-dispatch exited ${result.exitCode}\``);
+    if (result.stderrTail) lines.push(`stderr_tail:\n\`\`\`\n${result.stderrTail}\n\`\`\``);
+  }
+  lines.push("", result.resultMd.trim() || "_result.md was empty_");
+  if (role === "worker" && result.diffStat.trim()) {
+    lines.push("", "post-diff-stat:", "```", result.diffStat.trim(), "```");
+  }
+  return lines.filter((line) => line !== "").join("\n");
+}
+
+function formatDispatchError(role: CodexRole, err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const tail = err instanceof DispatchCodexRoleError ? err.stderrTail : "";
+  const lines = [`**codex-${role}** dispatch failed`, `error: ${message}`];
+  if (tail) lines.push("stderr_tail:", "```", tail, "```");
+  return lines.join("\n");
+}
 
 const slashCommands = [
   new SlashCommandBuilder().setName("help").setDescription("Show available commands"),
@@ -554,6 +813,10 @@ const slashCommands = [
     .addStringOption(o => o.setName("path").setDescription("Absolute path to directory").setRequired(true)),
   new SlashCommandBuilder().setName("stop").setDescription("Kill running Codex process (thread only)"),
   new SlashCommandBuilder().setName("sessions").setDescription("List all active sessions"),
+  new SlashCommandBuilder().setName("codex-worker").setDescription("Dispatch a worker role packet").addStringOption(o => o.setName("workdir").setDescription("Absolute git workdir").setRequired(true)).addStringOption(o => o.setName("objective").setDescription("Worker objective").setRequired(true)).addStringOption(o => o.setName("write_scope").setDescription("Optional CSV of repo-relative writable paths")),
+  new SlashCommandBuilder().setName("codex-verifier").setDescription("Dispatch a verifier role packet").addStringOption(o => o.setName("workdir").setDescription("Absolute git workdir").setRequired(true)).addStringOption(o => o.setName("claim").setDescription("Claim to verify").setRequired(true)),
+  new SlashCommandBuilder().setName("codex-reviewer").setDescription("Dispatch a reviewer role packet").addStringOption(o => o.setName("workdir").setDescription("Absolute git workdir").setRequired(true)).addStringOption(o => o.setName("target").setDescription("Git ref or path to review").setRequired(true)),
+  new SlashCommandBuilder().setName("codex-synthesizer").setDescription("Dispatch a synthesizer role packet").addStringOption(o => o.setName("workdir").setDescription("Absolute git workdir").setRequired(true)).addStringOption(o => o.setName("findings").setDescription("Findings to synthesize").setRequired(true)),
 ];
 
 if (!DISCORD_TOKEN) {
@@ -698,10 +961,46 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       return;
     }
+
+    const codexRole = roleFromCommand(commandName);
+    if (codexRole) {
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      if (running.has(threadId)) {
+        await interaction.reply({ content: "Previous task still running. Use `/stop` first.", ephemeral: true });
+        return;
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+      const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+      const includeDisclosure = !entry.started;
+      try {
+        const opts = buildDispatchOptions(codexRole, interaction);
+        const result = await dispatchCodexRole(codexRole, opts);
+        const responseText = formatDispatchResult(codexRole, result, includeDisclosure);
+        const botReply = responseText.length <= DISCORD_MAX_LEN
+          ? await interaction.channel.send(responseText)
+          : await sendChunked(interaction.channel, responseText);
+        if (includeDisclosure) entry.started = true;
+        entry.lastBotMessageId = botReply.id;
+        saveEntry(threadId, entry);
+        await interaction.editReply(`codex-${codexRole} finished: \`${path.basename(result.runDir)}\``).catch(() => {});
+      } catch (err) {
+        const errorText = formatDispatchError(codexRole, err);
+        await sendChunked(interaction.channel, errorText).catch(() => {});
+        await interaction.editReply(`codex-${codexRole} failed: ${(err as Error).message}`).catch(() => {});
+      }
+      return;
+    }
   } catch (err) {
     console.error("[discord-cc-bot] interaction error:", (err as Error).message);
     if (!interaction.replied) {
       await interaction.reply({ content: "An error occurred.", ephemeral: true }).catch(() => {});
+    } else {
+      await interaction.editReply("An error occurred.").catch(() => {});
     }
   }
 });
