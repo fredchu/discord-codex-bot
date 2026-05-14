@@ -1,106 +1,24 @@
 # Changelog
 
-## 0.8.2 - 2026-04-02
+## 0.1.0 - 2026-05-14 (planned)
 
-### Fixes
-- Fix bot sessions not appearing in CC's `/resume` picker (CC 2.1.90+ filters `entrypoint:"sdk-cli"`)
-- Patch session files after each run to rewrite entrypoint, making bot sessions discoverable
+### Initial fork
 
-## 0.8.1 - 2026-04-02
+Forked from [discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot) v0.8.2 — same Discord thread bridging pattern, adapted for OpenAI Codex CLI 0.128+.
 
-### Improvements
-- Increase task timeout from 30 to 90 minutes for long-running operations
+### Features (planned for v0.1.0)
 
-## 0.8.0 - 2026-03-26
+- **codex exec runner**: mention or slash command in allowed channels routes prompt to `codex exec` with thread-scoped session resume
+- **Session resume**: `codex exec --json` parses first SessionConfigured event for session UUID; subsequent turns use `codex exec resume <uuid>`
+- **Sandbox per thread**: each Discord thread maps to an isolated workdir; `codex --sandbox workspace-write` by default (override via env)
+- **Role contract dispatch**: 4 slash commands (`/codex-worker`, `/codex-verifier`, `/codex-reviewer`, `/codex-synthesizer`) mirror `~/.claude/skills/codex-dispatch/` packet format
+- **Quota guard**: per-user rate limit + token cap
+- **Trust boundary**: bot rejects non-allowlisted guilds/channels; sensitive-path blocklist; sandbox-write scope enforced by codex itself
+- **AI disclosure**: every bot response footer marks it as AI-generated
 
-### Improvements
-- System prompt now instructs Claude to avoid markdown tables (Discord cannot render them)
-- Bold key-value line format for comparisons (mobile-friendly, no horizontal scrolling)
-- Applied to both `SYSTEM_PROMPT` and `RESUME_SYSTEM_PROMPT`
+### Differences from upstream CC bot
 
-## 0.7.0 - 2026-03-25
-
-### Features
-- File attachment support — images, code, PDFs, or any file sent in Discord are auto-downloaded and passed to Claude Code via the Read tool
-- Type-agnostic design: no per-format handling, Claude Code decides how to read each file
-- 10 MB per-file size limit, temp files auto-cleaned after response
-
-## 0.6.0 - 2026-03-25
-
-### Features
-- `/resume-local` command — resume a local terminal Claude Code session from Discord (mobile use case)
-  - Auto-discover active sessions from `~/.claude/sessions/` PID files
-  - Fallback to recent sessions from `~/.claude/history.jsonl` with last prompt display
-  - Select menu for multiple sessions, showing last prompt + project path
-  - Blocks resume of still-running sessions (must `/quit` in terminal first)
-- `/handback` command — hand session back to terminal, reset thread to fresh bot session
-- Dedicated `RESUME_SYSTEM_PROMPT` for resumed sessions (lighter than bot system prompt)
-- `isLocalResume` flag in DB to distinguish bot-created vs resumed sessions
-- Capture stderr from Claude CLI — show error details instead of bare `(no output)`
-
-## 0.5.0 - 2026-03-23
-
-### Features
-- Replace `thread-map.json` with SQLite (`better-sqlite3` + WAL mode) for crash-safe session storage
-- Auto-migrate existing JSON data to SQLite on first startup (rename `.bak` after success)
-- Per-entry upsert via `saveEntry()` instead of full-file overwrite
-- Graceful shutdown on both SIGINT and SIGTERM (closes DB properly)
-
-## 0.4.2 - 2026-03-23
-
-### Fixes
-- Rewrite `splitMessage` with segment-based approach — code blocks are never broken across Discord message chunks
-- Oversized code blocks (>2000 chars) are split and re-wrapped with proper fences on each chunk
-- Long AskUserQuestion replies now use `sendChunked` instead of truncating at 2000 chars
-
-## 0.4.1 - 2026-03-23
-
-### Fixes
-- Fix duplicate message in thread history — current trigger message was included in the history block and appended again as prompt content
-
-## 0.4.0 - 2026-03-23
-
-### Features
-- Interactive Discord buttons for AskUserQuestion permission prompts (replaces plain text)
-- Button click resumes Claude session with user's choice
-- Chained AskUserQuestion support (button → resume → another question → buttons again)
-- "Other..." button option for free-text answers
-
-### Improvements
-- Extract `sendAskButtons` helper to deduplicate button rendering logic
-- Extract `createToolUseHandler` helper to deduplicate streaming callbacks
-- Add Discord customId length guard (`.slice(0, 100)`)
-- Simplify redundant try/catch in button handler reply flow
-
-## 0.3.0 - 2026-03-19
-
-### Features
-- Increase task timeout from 10 to 30 minutes for long-running operations
-- Return partial results on timeout instead of empty error
-- Show elapsed time in streaming preview (e.g. "working... (2m34s)")
-- Display recent tool names in preview (e.g. "🔧 Read → Grep → Edit")
-
-## 0.2.1 - 2026-03-19
-
-### Fixes
-- Send final reply as new message instead of editing preview, ensuring Discord push notifications are triggered
-
-## 0.2.0 - 2026-03-16
-
-### Features
-- Streaming response with real-time Discord message updates (stream-json mode, 1.5s throttle, 40-char minimum delta)
-- Long message auto-splitting for streaming output
-
-### Fixes
-- Correct ACP repository link in README
-
-## 0.1.0 - 2026-03-09
-
-### Features
-- Discord thread ↔ Claude Code CLI session bridging with automatic `--resume`
-- Thread context awareness (fetches last 30 messages)
-- 6 slash commands: `/help`, `/new`, `/model`, `/cd`, `/stop`, `/sessions`
-- Model switching per thread (opus, sonnet, haiku)
-- Long responses sent as `.txt` attachments
-- Typing indicator during Claude execution
-- AI disclosure on first reply per session
+- CLI: `codex exec` instead of `claude -p`; no `--session-id` (codex generates UUID on first run)
+- Sandbox: codex has native `--sandbox` (read-only/workspace-write/danger-full-access); CC bot relied on hook-based protection
+- Auth: ChatGPT subscription default (`codex login`); API key fallback via `OPENAI_API_KEY`
+- No `patchSessionEntrypoint` equivalent — codex sessions are independent of bot
