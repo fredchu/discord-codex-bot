@@ -393,16 +393,17 @@ function runCodexStreaming(opts: {
       ? `${opts.systemPrompt}\n\n---\n\n${opts.prompt}`
       : opts.prompt;
 
-    // --dangerously-bypass-approvals-and-sandbox both skips approvals AND disables
-    // codex's built-in sandbox; do NOT also pass --sandbox (codex exec resume rejects it
-    // as an unexpected argument, and on a new run the two flags are redundant).
+    // `codex exec resume` only accepts a subset of flags — no --sandbox, no -C.
+    // Resume inherits cwd from the original session; --dangerously-bypass-approvals-and-sandbox
+    // already disables the built-in sandbox, so --sandbox is redundant on new runs too.
+    const isResume = opts.resume && !!opts.sessionId;
     const baseArgs: string[] = [
       "exec",
-      ...(opts.resume && opts.sessionId ? ["resume", opts.sessionId] : []),
+      ...(isResume ? ["resume", opts.sessionId] : []),
       "--json",
       "--dangerously-bypass-approvals-and-sandbox",
-      "-C", opts.cwd,
       "--skip-git-repo-check",
+      ...(isResume ? [] : ["-C", opts.cwd]),
       ...(opts.model ? ["-m", opts.model] : []),
       fullPrompt,
     ];
