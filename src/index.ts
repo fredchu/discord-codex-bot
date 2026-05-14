@@ -1,13 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import Database from "better-sqlite3";
 import {
   Client, GatewayIntentBits, Events,
   REST, Routes, SlashCommandBuilder,
-  ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
   type Message, type Collection, type Snowflake,
 } from "discord.js";
 
@@ -20,7 +17,6 @@ type ThreadEntry = {
   createdAt: number;
   started: boolean;
   lastBotMessageId?: string;
-  isLocalResume?: boolean;
 };
 
 type ThreadMap = Record<string, ThreadEntry>;
@@ -38,12 +34,8 @@ db.exec(`CREATE TABLE IF NOT EXISTS threads (
   model TEXT NOT NULL,
   createdAt INTEGER NOT NULL,
   started INTEGER NOT NULL DEFAULT 0,
-  lastBotMessageId TEXT,
-  isLocalResume INTEGER NOT NULL DEFAULT 0
+  lastBotMessageId TEXT
 )`);
-
-// Migration: add isLocalResume column if missing
-try { db.exec("ALTER TABLE threads ADD COLUMN isLocalResume INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
 
 // One-time migration from JSON → SQLite
 if (fs.existsSync(JSON_PATH)) {
@@ -69,8 +61,8 @@ if (fs.existsSync(JSON_PATH)) {
 // Prepared statements
 const stmtGet = db.prepare("SELECT * FROM threads WHERE threadId = ?");
 const stmtUpsert = db.prepare(
-  `INSERT OR REPLACE INTO threads (threadId, sessionId, cwd, model, createdAt, started, lastBotMessageId, isLocalResume)
-   VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId, @isLocalResume)`,
+  `INSERT OR REPLACE INTO threads (threadId, sessionId, cwd, model, createdAt, started, lastBotMessageId)
+   VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId)`,
 );
 const stmtAll = db.prepare("SELECT * FROM threads");
 
@@ -82,7 +74,6 @@ function rowToEntry(row: any): ThreadEntry {
     createdAt: row.createdAt,
     started: !!row.started,
     lastBotMessageId: row.lastBotMessageId ?? undefined,
-    isLocalResume: !!row.isLocalResume,
   };
 }
 
@@ -103,7 +94,6 @@ function saveEntry(threadId: string, entry: ThreadEntry): void {
     createdAt: entry.createdAt,
     started: entry.started ? 1 : 0,
     lastBotMessageId: entry.lastBotMessageId ?? null,
-    isLocalResume: entry.isLocalResume ? 1 : 0,
   });
 }
 
@@ -126,126 +116,6 @@ function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): Thre
   return map[threadId];
 }
 
-// --- Local Session Discovery ---
-
-const CLAUDE_HOME = path.join(process.env.HOME ?? "", ".claude");
-
-/**
- * Patch session file so CC's /resume picker can discover it.
- * CC 2.1.90+ filters out sessions with entrypoint:"sdk-cli" from the picker.
- * Rewriting to "cli" makes bot sessions visible alongside interactive ones.
- */
-function patchSessionEntrypoint(sessionId: string, cwd: string): void {
-  try {
-    const sanitized = cwd.replace(/[^a-zA-Z0-9]/g, "-");
-    const projectDir = path.join(CLAUDE_HOME, "projects", sanitized);
-    const sessionFile = path.join(projectDir, `${sessionId}.jsonl`);
-    if (!fs.existsSync(sessionFile)) return;
-    const content = fs.readFileSync(sessionFile, "utf8");
-    if (!content.includes('"entrypoint":"sdk-cli"')) return;
-    fs.writeFileSync(sessionFile, content.replaceAll('"entrypoint":"sdk-cli"', '"entrypoint":"cli"'));
-  } catch { /* best-effort */ }
-}
-
-type LocalSession = {
-  sessionId: string;
-  cwd: string;
-  pid?: number;
-  alive: boolean;
-  startedAt?: number;
-  mtime: number;
-  lastPrompt?: string;
-};
-
-function isProcessAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
-function discoverLocalSessions(): LocalSession[] {
-  const sessions: LocalSession[] = [];
-
-  // Active sessions from PID files — these have reliable CWD
-  const sessionsDir = path.join(CLAUDE_HOME, "sessions");
-  if (fs.existsSync(sessionsDir)) {
-    for (const file of fs.readdirSync(sessionsDir)) {
-      if (!file.endsWith(".json")) continue;
-      try {
-        const data = JSON.parse(fs.readFileSync(path.join(sessionsDir, file), "utf8"));
-        const alive = isProcessAlive(data.pid);
-        // Skip stale PID files (process dead)
-        if (!alive) continue;
-        sessions.push({
-          sessionId: data.sessionId,
-          cwd: data.cwd,
-          pid: data.pid,
-          alive: true,
-          startedAt: data.startedAt,
-          mtime: data.startedAt ?? 0,
-        });
-      } catch { /* skip malformed */ }
-    }
-  }
-
-  // Also check history.jsonl for recent sessions + last prompt per session
-  const historyPath = path.join(CLAUDE_HOME, "history.jsonl");
-  const promptBySession = new Map<string, string>(); // sessionId → last prompt
-  if (fs.existsSync(historyPath)) {
-    const seen = new Set(sessions.map(s => s.sessionId));
-    try {
-      const lines = fs.readFileSync(historyPath, "utf8").trim().split("\n");
-      // Read last 50 lines to get enough prompt context
-      const recent = lines.slice(-50);
-      const bySession = new Map<string, { cwd: string; mtime: number }>();
-      for (const line of recent) {
-        try {
-          const entry = JSON.parse(line);
-          const cwd = entry.cwd || entry.project;
-          if (entry.sessionId) {
-            if (entry.display) {
-              promptBySession.set(entry.sessionId, entry.display);
-            }
-            if (cwd) {
-              bySession.set(entry.sessionId, {
-                cwd,
-                mtime: typeof entry.timestamp === "number" ? entry.timestamp : 0,
-              });
-            }
-          }
-        } catch { /* skip */ }
-      }
-      // Add top 5 unseen sessions
-      const candidates = [...bySession.entries()]
-        .filter(([sid]) => !seen.has(sid))
-        .sort((a, b) => b[1].mtime - a[1].mtime)
-        .slice(0, 5);
-      for (const [sid, info] of candidates) {
-        sessions.push({
-          sessionId: sid,
-          cwd: info.cwd,
-          alive: false,
-          mtime: info.mtime,
-          lastPrompt: promptBySession.get(sid),
-        });
-      }
-    } catch { /* skip */ }
-  }
-
-  // Attach lastPrompt to PID-discovered sessions too
-  for (const s of sessions) {
-    if (!s.lastPrompt && promptBySession.has(s.sessionId)) {
-      s.lastPrompt = promptBySession.get(s.sessionId);
-    }
-  }
-
-  // Sort: alive first, then by mtime descending
-  sessions.sort((a, b) => {
-    if (a.alive !== b.alive) return a.alive ? -1 : 1;
-    return b.mtime - a.mtime;
-  });
-
-  return sessions;
-}
-
 // --- Thread History ---
 
 const SYSTEM_PROMPT = [
@@ -253,19 +123,6 @@ const SYSTEM_PROMPT = [
   "Multiple users may be talking in the same thread.",
   "When thread history is provided, use it as context to understand the conversation so far.",
   "Reply naturally as a participant in the group conversation.",
-  "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
-  "Respond directly and immediately to the user's message.",
-  "",
-  "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax (| col | col |).",
-  "When comparing items, use bold label + slash-separated attributes on one line per item, e.g.:",
-  "**Opus** — Speed: Slow / Quality: Best / Price: $$$",
-  "**Sonnet** — Speed: Fast / Quality: Good / Price: $$",
-  "**Haiku** — Speed: Fastest / Quality: OK / Price: $",
-].join("\n");
-
-const RESUME_SYSTEM_PROMPT = [
-  "User is continuing this conversation from Discord (mobile).",
-  "This is the same session, just a different interface — respond normally.",
   "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
   "Respond directly and immediately to the user's message.",
   "",
@@ -328,20 +185,7 @@ type StreamCallbacks = {
   onToolUse?: (toolName: string) => void;
 };
 
-type AskQuestion = {
-  question: string;
-  header: string;
-  options: { label: string; description: string }[];
-  multiSelect: boolean;
-};
-
-type PermissionDenial = {
-  tool_name: string;
-  tool_use_id: string;
-  tool_input: { questions: AskQuestion[] };
-};
-
-type RunResult = { text: string; exitCode: number; costUsd?: number; permissionDenials?: PermissionDenial[] };
+type RunResult = { text: string; exitCode: number };
 
 type CodexUsage = {
   inputTokens: number;
@@ -491,41 +335,6 @@ function runCodexStreaming(opts: {
       });
     });
   });
-}
-
-// --- AskUserQuestion button rendering ---
-
-async function sendAskButtons(
-  channel: { send: (opts: any) => Promise<Message> },
-  threadId: string,
-  entry: ThreadEntry,
-  denial: PermissionDenial,
-): Promise<void> {
-  for (const q of denial.tool_input.questions) {
-    const row = new ActionRowBuilder<ButtonBuilder>();
-    for (const opt of q.options.slice(0, 4)) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setCustomId(`ask_${entry.sessionId}_${opt.label}`.slice(0, 100))
-          .setLabel(opt.label)
-          .setStyle(ButtonStyle.Primary),
-      );
-    }
-    if (q.options.length <= 3) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setCustomId(`ask_${entry.sessionId}_OTHER`)
-          .setLabel("Other...")
-          .setStyle(ButtonStyle.Secondary),
-      );
-    }
-    const botReply = await channel.send({
-      content: `❓ **${q.question}**`,
-      components: [row],
-    });
-    entry.lastBotMessageId = botReply.id;
-  }
-  saveEntry(threadId, entry);
 }
 
 // --- Streaming tool-use callback ---
@@ -739,15 +548,12 @@ const GUILD_ID = process.env.GUILD_ID;
 const slashCommands = [
   new SlashCommandBuilder().setName("help").setDescription("Show available commands"),
   new SlashCommandBuilder().setName("new").setDescription("Clear context — start a new conversation (thread only)"),
-  new SlashCommandBuilder().setName("model").setDescription("Switch Claude model")
+  new SlashCommandBuilder().setName("model").setDescription("Switch Codex model")
     .addStringOption(o => o.setName("name").setDescription("Model name (e.g. sonnet, opus, haiku)").setRequired(true)),
   new SlashCommandBuilder().setName("cd").setDescription("Switch working directory")
     .addStringOption(o => o.setName("path").setDescription("Absolute path to directory").setRequired(true)),
-  new SlashCommandBuilder().setName("stop").setDescription("Kill running Claude process (thread only)"),
+  new SlashCommandBuilder().setName("stop").setDescription("Kill running Codex process (thread only)"),
   new SlashCommandBuilder().setName("sessions").setDescription("List all active sessions"),
-  new SlashCommandBuilder().setName("resume-local").setDescription("Resume a local terminal Claude Code session")
-    .addStringOption(o => o.setName("session").setDescription("Session ID (auto-detect if omitted)").setRequired(false)),
-  new SlashCommandBuilder().setName("handback").setDescription("Hand session back to terminal"),
 ];
 
 if (!DISCORD_TOKEN) {
@@ -787,72 +593,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const id = interaction.customId;
     console.log(`[discord-cc-bot] button: ${id} by ${interaction.user.username}`);
 
-    // AskUserQuestion buttons: ask_<sessionId>_<answer>
-    if (id.startsWith("ask_")) {
-      const parts = id.split("_");
-      const sessionId = parts[1];
-      const answer = parts.slice(2).join("_");
-      const threadId = interaction.channelId;
-      const entry = threadMap[threadId];
-
-      if (answer === "OTHER") {
-        await interaction.reply({ content: "Type your answer as a regular message:", ephemeral: true });
-        return;
-      }
-
-      await interaction.update({ content: `✅ **${answer}**`, components: [] });
-
-      // Resume codex with the answer
-      if (entry && !running.has(threadId)) {
-        const ch = interaction.channel!;
-        if (!("send" in ch)) return;
-        const previewState = createPreviewState();
-        previewState.msg = await ch.send("⏳ *Continuing...*");
-
-        try {
-          const result = await runCodexStreaming({
-            threadId,
-            sessionId: entry.sessionId,
-            prompt: `I choose: ${answer}`,
-            cwd: entry.cwd,
-            model: entry.model || CODEX_MODEL,
-            codexBin: CODEX_BIN,
-            sandbox: CODEX_SANDBOX,
-            resume: !!entry.sessionId,
-            systemPrompt: SYSTEM_PROMPT,
-            callbacks: {
-              onText: (fullText) => handleStreamText(previewState, fullText),
-              onToolUse: createToolUseHandler(previewState),
-            },
-          });
-
-          if (previewState.timer) clearTimeout(previewState.timer);
-
-          // codex does not emit Claude-style AskUserQuestion permission denials;
-          // TODO(codex-cleanup): remove sendAskButtons + PermissionDenial type in v0.2 if not needed
-
-          if (result.sessionId && result.sessionId !== entry.sessionId) {
-            entry.sessionId = result.sessionId;
-          }
-
-          await previewState.msg!.delete().catch(() => {});
-          let botReply: Message;
-          if (result.text.length <= DISCORD_MAX_LEN) {
-            botReply = await ch.send(result.text);
-          } else {
-            botReply = await sendChunked(ch, result.text);
-          }
-          entry.lastBotMessageId = botReply.id;
-          // TODO(codex-cleanup): patchSessionEntrypoint is claude-specific, remove in v0.2
-          saveEntry(threadId, entry);
-        } catch (err) {
-          if (previewState.timer) clearTimeout(previewState.timer);
-          if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
-        }
-      }
-      return;
-    }
-
     // Test buttons (temporary)
     if (id.startsWith("test_")) {
       const choice = id.replace("test_", "");
@@ -864,34 +604,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    return;
-  }
-
-  // --- Select menu handler (resume-local session picker) ---
-  if (interaction.isStringSelectMenu() && interaction.customId === "resume_local_select") {
-    const sessionId = interaction.values[0];
-    const threadId = interaction.channelId;
-    const locals = discoverLocalSessions();
-    const picked = locals.find(s => s.sessionId === sessionId);
-    const cwd = picked?.cwd ?? DEFAULT_CWD;
-    const alive = picked?.alive ?? false;
-
-    const entry = getOrCreate(threadMap, threadId, cwd);
-    entry.sessionId = sessionId;
-    entry.cwd = cwd;
-    entry.isLocalResume = true;
-    entry.started = true;
-    saveEntry(threadId, entry);
-
-    const status = alive ? "🟢 terminal still running" : "🔵 inactive";
-    await interaction.update({
-      content:
-        `📱 已接手本地 session \`${sessionId.slice(0, 8)}…\` (${status})\n` +
-        `cwd: \`${cwd}\`\n\n` +
-        (alive ? `> ⚠️ Terminal CC 還在跑。建議先在 terminal 輸入 \`/quit\`。\n` : "") +
-        `> 💻 回到 terminal 後：\`/quit\` → \`claude --continue\``,
-      components: [],
-    });
     return;
   }
 
@@ -908,8 +620,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           "`/cd <path>` — switch working directory",
           "`/stop` — kill running task (thread only)",
           "`/sessions` — list all sessions",
-          "`/resume-local [session]` — resume a local terminal CC session",
-          "`/handback` — hand session back to terminal",
         ].join("\n"),
         ephemeral: true,
       });
@@ -980,126 +690,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (commandName === "sessions") {
       const lines = Object.entries(threadMap).map(
-        ([tid, e]) => `<#${tid}> | ${e.model} | \`${e.cwd}\`${e.isLocalResume ? " 📱" : ""}`,
+        ([tid, e]) => `<#${tid}> | ${e.model} | \`${e.cwd}\``,
       );
       await interaction.reply({
         content: lines.length ? lines.join("\n") : "No sessions.",
         ephemeral: true,
       });
-      return;
-    }
-
-    if (commandName === "resume-local") {
-      if (!interaction.channel?.isThread()) {
-        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
-        return;
-      }
-      const threadId = interaction.channelId;
-      const explicitId = interaction.options.getString("session");
-
-      if (explicitId) {
-        // Direct resume with explicit session ID
-        const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
-        entry.sessionId = explicitId;
-        entry.isLocalResume = true;
-        entry.started = true; // always resume mode for local sessions
-        saveEntry(threadId, entry);
-        await interaction.reply(
-          `📱 已接手本地 session \`${explicitId.slice(0, 8)}…\`\ncwd: \`${entry.cwd}\`\n\n` +
-          `> 💻 回到 terminal 後：\`/quit\` → \`claude --continue\``,
-        );
-        return;
-      }
-
-      // Auto-discover local sessions
-      const locals = discoverLocalSessions();
-      if (locals.length === 0) {
-        await interaction.reply({ content: "No local sessions found.", ephemeral: true });
-        return;
-      }
-
-      // Filter: only sessions that are NOT alive (can't resume a running session)
-      const resumable = locals.filter(s => !s.alive);
-      const aliveCount = locals.length - resumable.length;
-
-      if (resumable.length === 0) {
-        const hint = aliveCount > 0
-          ? `Found ${aliveCount} active session(s), but can't resume a running CC.\n` +
-            `請先在 terminal 輸入 \`/quit\` 退出，再回來 \`/resume-local\`。`
-          : "No local sessions found.";
-        await interaction.reply({ content: hint, ephemeral: true });
-        return;
-      }
-
-      if (resumable.length === 1) {
-        const s = resumable[0];
-        const entry = getOrCreate(threadMap, threadId, s.cwd);
-        entry.sessionId = s.sessionId;
-        entry.cwd = s.cwd;
-        entry.isLocalResume = true;
-        entry.started = true;
-        saveEntry(threadId, entry);
-        const promptHint = s.lastPrompt ? `\nLast prompt: *${s.lastPrompt.slice(0, 100)}*\n` : "\n";
-        await interaction.reply(
-          `📱 已接手本地 session \`${s.sessionId.slice(0, 8)}…\`` +
-          promptHint +
-          `cwd: \`${s.cwd}\`\n\n` +
-          (aliveCount > 0 ? `> ⚠️ 另有 ${aliveCount} 個活躍 session 無法 resume（需先在 terminal \`/quit\`）\n` : "") +
-          `> 💻 回到 terminal 後：\`claude --continue\``,
-        );
-        return;
-      }
-
-      // Multiple resumable sessions — show select menu
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId("resume_local_select")
-        .setPlaceholder("Pick a session to resume")
-        .addOptions(
-          resumable.slice(0, 10).map((s) => {
-            const ago = Math.round((Date.now() - s.mtime) / 60000);
-            const timeStr = ago < 60 ? `${ago}m` : `${Math.round(ago / 60)}h`;
-            const prompt = s.lastPrompt ?? "(no prompt)";
-            // Label: last prompt (max 100 chars, Discord limit)
-            const label = `${prompt.slice(0, 95)}`;
-            // Description: time ago + cwd
-            const project = s.cwd.split("/").slice(-2).join("/");
-            const desc = `${timeStr} ago · ${project}`;
-            return new StringSelectMenuOptionBuilder()
-              .setLabel(label.slice(0, 100) || "(empty)")
-              .setDescription(desc.slice(0, 100))
-              .setValue(s.sessionId);
-          }),
-        );
-
-      const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
-      await interaction.reply({ content: "Select a local session to resume:", components: [row], ephemeral: true });
-      return;
-    }
-
-    if (commandName === "handback") {
-      if (!interaction.channel?.isThread()) {
-        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
-        return;
-      }
-      const threadId = interaction.channelId;
-      const entry = threadMap[threadId];
-      if (!entry?.isLocalResume) {
-        await interaction.reply({ content: "This thread is not a resumed local session.", ephemeral: true });
-        return;
-      }
-      // Kill any running process
-      if (running.has(threadId)) {
-        running.get(threadId)!.kill("SIGTERM");
-      }
-      // Reset to a fresh bot session
-      entry.isLocalResume = false;
-      entry.sessionId = ""; // codex assigns thread_id on next run
-      entry.started = false;
-      saveEntry(threadId, entry);
-      await interaction.reply(
-        `💻 已交還 session。回到 terminal 輸入 \`claude --continue\` 即可看到完整對話。\n` +
-        `此 thread 已重置，下次訊息會開始新的 bot session。`,
-      );
       return;
     }
   } catch (err) {
@@ -1170,7 +766,7 @@ client.on(Events.MessageCreate, async (message) => {
         codexBin: CODEX_BIN,
         sandbox: CODEX_SANDBOX,
         resume: entry.started && !!entry.sessionId,
-        systemPrompt: entry.isLocalResume ? RESUME_SYSTEM_PROMPT : SYSTEM_PROMPT,
+        systemPrompt: SYSTEM_PROMPT,
         callbacks: {
           onText: (fullText) => handleStreamText(previewState, fullText),
           onToolUse: createToolUseHandler(previewState),
@@ -1179,9 +775,6 @@ client.on(Events.MessageCreate, async (message) => {
 
       // Cancel any pending throttle timer
       if (previewState.timer) clearTimeout(previewState.timer);
-
-      // codex does not emit AskUserQuestion-style permission denials;
-      // TODO(codex-cleanup): remove sendAskButtons + AskQuestion / PermissionDenial types in v0.2.
 
       // Persist codex-assigned session UUID after first run (or if it changed)
       if (result.sessionId && result.sessionId !== entry.sessionId) {
@@ -1193,9 +786,7 @@ client.on(Events.MessageCreate, async (message) => {
         entry.started = true;
       }
 
-      const disclosure = (isFirstReply && !entry.isLocalResume)
-        ? "*I'm Codex, an AI assistant by OpenAI.*\n\n"
-        : "";
+      const disclosure = isFirstReply ? "*I'm Codex, an AI assistant by OpenAI.*\n\n" : "";
       const responseText = `${disclosure}${result.text}`;
 
       // Final delivery — always delete preview and send new message
@@ -1214,7 +805,6 @@ client.on(Events.MessageCreate, async (message) => {
       }
 
       entry.lastBotMessageId = botReply.id;
-      // TODO(codex-cleanup): patchSessionEntrypoint is claude-specific, remove in v0.2
       saveEntry(threadId, entry);
     } catch (err) {
       if (previewState.timer) clearTimeout(previewState.timer);
