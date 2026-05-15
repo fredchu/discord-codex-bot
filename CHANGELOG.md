@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-05-15
+
+### Security
+
+- **Symlink-resistant blocklist**: `isBlockedPath` now resolves the deepest existing ancestor with `fs.realpathSync` (and normalizes the configured `SENSITIVE_PATH_BLOCKLIST` the same way) before applying the prefix match, so a symlink at a non-blocked location pointing into `~/.ssh`, `~/.codex`, or any other blocked prefix cannot bypass the gate.
+
+### Added
+
+- **`CODEX_DISPATCH_BIN` / `CODEX_DISPATCH_PACKET_DIR`**: the `codex-dispatch` binary path and task-packet directory are now environment-driven. Defaults are `codex-dispatch` on `PATH` and `<os.tmpdir()>/discord-codex-bot-packets`, replacing the previous hard-coded developer paths.
+- **Token usage in role replies**: `/codex-worker`, `/codex-verifier`, `/codex-reviewer`, and `/codex-synthesizer` now read `events.jsonl` from the codex-dispatch run directory, sum every `turn.completed.usage` payload, and append `usage: in=... (cached ...) · out=... · reasoning=...` to the Discord reply.
+
+### Changed
+
+- **Single key-value reply header**: collapsed the redundant `RESULT`/`POLICY VIOLATION` lines emitted alongside the backticked `policy_violation`/`exit_code` lines. The dispatch reply header now uses one consistent `key: \`value\`` form across `result`, `policy_violation`, `exit_code`, and `usage`.
+- **Unified log prefix**: every runtime log line now uses `[discord-codex-bot]`. The legacy `[discord-cc-bot]` prefix carried over from the fork is gone.
 
 ### Removed
 

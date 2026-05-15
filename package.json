@@ -1,6 +1,6 @@
 {
   "name": "discord-codex-bot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Discord bot that bridges thread conversations to OpenAI Codex CLI via codex exec — supports session resume, role-contract dispatch (worker/verifier/reviewer/synthesizer), and sandbox isolation per Discord thread.",
   "type": "module",
   "license": "MIT",

@@ -2,7 +2,7 @@
 
 [中文版](README.zh-TW.md)
 
-Discord bot that bridges Discord thread conversations to OpenAI Codex CLI through `codex exec`. v0.1.0 is the initial open-source release: a compact TypeScript bot with thread-scoped Codex sessions, sandboxed workdirs, role-contract dispatch commands, quota guards, and explicit Discord trust boundaries.
+Discord bot that bridges Discord thread conversations to OpenAI Codex CLI through `codex exec`. A compact TypeScript bot with thread-scoped Codex sessions, sandboxed workdirs, role-contract dispatch commands, quota guards, and explicit Discord trust boundaries.
 
 Forked from [discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot) v0.8.2 and adapted for `codex-cli` 0.128+.
 
@@ -80,6 +80,8 @@ The role commands require a Git workdir and use `codex-dispatch` artifacts (`pol
 | `SENSITIVE_PATH_BLOCKLIST` | No | CSV path-prefix blocklist for `DEFAULT_CWD`, `THREAD_WORKDIR_ROOT`, `/cd`, and role-command workdirs |
 | `THREAD_WORKDIR_ROOT` | No | Optional root where new threads get `discord-<thread_id>` workdirs |
 | `CODEX_RATE_LIMIT_PER_USER_HOUR` | No | Per-user request count per wall-clock hour bucket (default `30`) |
+| `CODEX_DISPATCH_BIN` | No | Path to the `codex-dispatch` binary (defaults to `codex-dispatch` on `PATH`) |
+| `CODEX_DISPATCH_PACKET_DIR` | No | Directory for role-dispatch task packets (defaults to `<os.tmpdir()>/discord-codex-bot-packets`) |
 
 ## Trust Boundary
 
@@ -94,7 +96,8 @@ Filesystem boundaries are enforced before starting Codex:
 
 - `SENSITIVE_PATH_BLOCKLIST` blocks sensitive prefixes such as `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.codex`, `${HOME}/.claude`, `/etc`, and `/root` by default.
 - The blocklist applies to `DEFAULT_CWD`, generated per-thread workdirs, `/cd`, mention-run `cwd`, and role-command `workdir`.
-- Codex itself still receives `--sandbox <CODEX_SANDBOX>`; v0.1.0 defaults to `workspace-write`.
+- Codex itself still receives `--sandbox <CODEX_SANDBOX>`; the default is `workspace-write`.
+- v0.2.0 resolves symlinks with `fs.realpathSync` before applying the blocklist, so a symlink at a non-blocked location pointing into a blocked prefix is still rejected.
 
 ## Quota Guard
 

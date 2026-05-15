@@ -2,7 +2,7 @@
 
 [English version](README.md)
 
-Discord bot，將 Discord thread 對話橋接到 OpenAI Codex CLI 的 `codex exec`。v0.1.0 是第一個開源版本：一個精簡的 TypeScript bot，提供 thread 範圍的 Codex session、sandbox workdir、role-contract dispatch 指令、quota guard，以及明確的 Discord trust boundary。
+Discord bot，將 Discord thread 對話橋接到 OpenAI Codex CLI 的 `codex exec`。一個精簡的 TypeScript bot，提供 thread 範圍的 Codex session、sandbox workdir、role-contract dispatch 指令、quota guard，以及明確的 Discord trust boundary。
 
 本專案 fork 自 [discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot) v0.8.2，並改為支援 `codex-cli` 0.128+。
 
@@ -80,6 +80,8 @@ Role commands 需要 Git workdir，並使用 `codex-dispatch` artifact（`policy
 | `SENSITIVE_PATH_BLOCKLIST` | No | 套用於 `DEFAULT_CWD`、`THREAD_WORKDIR_ROOT`、`/cd` 與 role-command workdirs 的 CSV path-prefix blocklist |
 | `THREAD_WORKDIR_ROOT` | No | Optional root；新的 threads 會取得 `discord-<thread_id>` workdirs |
 | `CODEX_RATE_LIMIT_PER_USER_HOUR` | No | 每使用者在 wall-clock hour bucket 內的 request count（預設 `30`） |
+| `CODEX_DISPATCH_BIN` | No | `codex-dispatch` binary path（預設為 `PATH` 上的 `codex-dispatch`） |
+| `CODEX_DISPATCH_PACKET_DIR` | No | Role-dispatch task packet 目錄（預設為 `<os.tmpdir()>/discord-codex-bot-packets`） |
 
 ## Trust Boundary
 
@@ -94,7 +96,8 @@ Filesystem boundary 會在啟動 Codex 前檢查：
 
 - `SENSITIVE_PATH_BLOCKLIST` 預設阻擋 `${HOME}/.ssh`、`${HOME}/.aws`、`${HOME}/.codex`、`${HOME}/.claude`、`/etc`、`/root` 等 sensitive prefix。
 - Blocklist 會套用到 `DEFAULT_CWD`、產生的 per-thread workdir、`/cd`、mention-run `cwd`，以及 role-command `workdir`。
-- Codex 本身仍會收到 `--sandbox <CODEX_SANDBOX>`；v0.1.0 預設為 `workspace-write`。
+- Codex 本身仍會收到 `--sandbox <CODEX_SANDBOX>`；預設為 `workspace-write`。
+- v0.2.0 起，blocklist 比對前會先用 `fs.realpathSync` 解 symlink，避免攻擊者用 symlink 把不在 blocklist 的路徑指向 blocked prefix 繞過閘門。
 
 ## Quota Guard
 
