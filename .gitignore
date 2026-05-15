@@ -43,3 +43,6 @@ npm-debug.log*
 
 # codex-dispatch worker artifacts
 .codex-dispatch/
+
+# Claude Code worktrees and session state
+.claude/
