@@ -242,16 +242,38 @@ function normalizeOptionalPath(value: string | undefined): string {
   return value?.trim() ? path.resolve(expandHome(value.trim())) : "";
 }
 
-function normalizeSensitivePath(value: string): string {
-  return path.resolve(expandHome(value));
+function resolveWithRealpath(value: string): string {
+  let target = path.resolve(expandHome(value));
+  const segments: string[] = [];
+  while (true) {
+    try {
+      const real = fs.realpathSync.native(target);
+      return segments.length ? path.join(real, ...segments.reverse()) : real;
+    } catch {
+      const parent = path.dirname(target);
+      if (parent === target) return path.resolve(expandHome(value));
+      segments.push(path.basename(target));
+      target = parent;
+    }
+  }
 }
 
-function isBlockedPath(candidatePath: string): boolean {
-  const resolved = path.resolve(expandHome(candidatePath));
+function normalizeSensitivePath(value: string): string {
+  return resolveWithRealpath(value);
+}
+
+function matchesBlocklist(resolved: string): boolean {
   return SENSITIVE_PATH_BLOCKLIST.some((blockedPrefix) => {
     const prefix = blockedPrefix.endsWith(path.sep) ? blockedPrefix : `${blockedPrefix}${path.sep}`;
     return resolved === blockedPrefix || resolved.startsWith(prefix);
   });
+}
+
+function isBlockedPath(candidatePath: string): boolean {
+  const resolved = path.resolve(expandHome(candidatePath));
+  if (matchesBlocklist(resolved)) return true;
+  const realResolved = resolveWithRealpath(candidatePath);
+  return realResolved !== resolved && matchesBlocklist(realResolved);
 }
 
 function cwdForNewThread(threadId: string, defaultCwd: string): string {
