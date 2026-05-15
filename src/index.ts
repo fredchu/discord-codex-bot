@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import Database from "better-sqlite3";
@@ -710,7 +711,9 @@ const ALLOWED_DM_USER_IDS = readCsvEnvSet("ALLOWED_DM_USER_IDS");
 const SENSITIVE_PATH_BLOCKLIST = readCsvEnv("SENSITIVE_PATH_BLOCKLIST", DEFAULT_SENSITIVE_PATH_BLOCKLIST)
   .map(normalizeSensitivePath)
   .filter(Boolean);
-const CODEX_DISPATCH_BIN = "/Users/fredchu/.claude/skills/codex-dispatch/bin/codex-dispatch", CODEX_DISPATCH_PACKET_DIR = "/tmp/codex-bot-packets", CODEX_DISPATCH_TIMEOUT_MS = 30 * 60 * 1000;
+const CODEX_DISPATCH_BIN = process.env.CODEX_DISPATCH_BIN ?? "codex-dispatch";
+const CODEX_DISPATCH_PACKET_DIR = process.env.CODEX_DISPATCH_PACKET_DIR ?? path.join(os.tmpdir(), "discord-codex-bot-packets");
+const CODEX_DISPATCH_TIMEOUT_MS = 30 * 60 * 1000;
 
 type CodexRole = "worker" | "verifier" | "reviewer" | "synthesizer";
 
