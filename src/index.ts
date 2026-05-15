@@ -61,9 +61,9 @@ if (fs.existsSync(JSON_PATH)) {
     });
     migrate();
     fs.renameSync(JSON_PATH, JSON_PATH + ".bak");
-    console.log(`[discord-cc-bot] migrated ${Object.keys(old).length} threads from JSON → SQLite`);
+    console.log(`[discord-codex-bot] migrated ${Object.keys(old).length} threads from JSON → SQLite`);
   } catch (err) {
-    console.error("[discord-cc-bot] JSON migration failed:", err);
+    console.error("[discord-codex-bot] JSON migration failed:", err);
   }
 }
 
@@ -492,7 +492,7 @@ function runCodexStreaming(opts: {
 
 function createToolUseHandler(ps: PreviewState): (toolName: string) => void {
   return (toolName) => {
-    console.log(`[discord-cc-bot] tool: ${toolName}`);
+    console.log(`[discord-codex-bot] tool: ${toolName}`);
     ps.toolsUsed.push(toolName);
     if (ps.msg) {
       const text = (ps.pendingText || "").slice(0, PREVIEW_MAX_LEN);
@@ -1020,7 +1020,7 @@ const client = new Client({
 });
 
 client.once(Events.ClientReady, async (c) => {
-  console.log(`[discord-cc-bot] ready as ${c.user.tag}`);
+  console.log(`[discord-codex-bot] ready as ${c.user.tag}`);
   const rest = new REST().setToken(DISCORD_TOKEN);
   try {
     const route = GUILD_ID
@@ -1029,9 +1029,9 @@ client.once(Events.ClientReady, async (c) => {
     await rest.put(route, {
       body: slashCommands.map(cmd => cmd.toJSON()),
     });
-    console.log(`[discord-cc-bot] registered ${slashCommands.length} slash commands`);
+    console.log(`[discord-codex-bot] registered ${slashCommands.length} slash commands`);
   } catch (err) {
-    console.error("[discord-cc-bot] failed to register commands:", err);
+    console.error("[discord-codex-bot] failed to register commands:", err);
   }
 });
 
@@ -1039,12 +1039,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // --- Button handler ---
   if (interaction.isButton()) {
     const id = interaction.customId;
-    console.log(`[discord-cc-bot] button: ${id} by ${interaction.user.username}`);
+    console.log(`[discord-codex-bot] button: ${id} by ${interaction.user.username}`);
 
     // Test buttons (temporary)
     if (id.startsWith("test_")) {
       const choice = id.replace("test_", "");
-      console.log(`[discord-cc-bot] test button: ${choice}`);
+      console.log(`[discord-codex-bot] test button: ${choice}`);
       await interaction.update({
         content: `✅ **你選了：${choice}**\n\nBot 收到了你的選擇！按鈕互動成功。`,
         components: [],
@@ -1216,7 +1216,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
   } catch (err) {
-    console.error("[discord-cc-bot] interaction error:", (err as Error).message);
+    console.error("[discord-codex-bot] interaction error:", (err as Error).message);
     if (!interaction.replied) {
       await interaction.reply({ content: "An error occurred.", ephemeral: true }).catch(() => {});
     } else {
@@ -1290,7 +1290,7 @@ client.on(Events.MessageCreate, async (message) => {
     const filePaths: string[] = [];
     for (const att of attachments) {
       if (att.size > ATTACH_MAX_BYTES) {
-        console.log(`[discord-cc-bot] skipping oversized attachment: ${att.name} (${att.size} bytes)`);
+        console.log(`[discord-codex-bot] skipping oversized attachment: ${att.name} (${att.size} bytes)`);
         continue;
       }
       const ext = att.name?.split(".").pop() ?? "bin";
@@ -1299,7 +1299,7 @@ client.on(Events.MessageCreate, async (message) => {
         await downloadAttachment(att.url, filepath);
         filePaths.push(filepath);
       } catch (err) {
-        console.error(`[discord-cc-bot] attachment download failed: ${(err as Error).message}`);
+        console.error(`[discord-codex-bot] attachment download failed: ${(err as Error).message}`);
       }
     }
 
@@ -1375,7 +1375,7 @@ client.on(Events.MessageCreate, async (message) => {
       for (const p of filePaths) fs.unlink(p, () => {});
     }
   } catch (err) {
-    console.error("[discord-cc-bot] handler error:", (err as Error).message);
+    console.error("[discord-codex-bot] handler error:", (err as Error).message);
   }
 });
 
