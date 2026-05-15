@@ -753,6 +753,7 @@ type DispatchCodexRoleResult = {
   runDir: string;
   exitCode: number;
   stderrTail: string;
+  usage?: CodexUsage;
 };
 
 class DispatchCodexRoleError extends Error {
@@ -862,6 +863,41 @@ function readRequiredArtifact(runDir: string, filename: string): string {
   return fs.readFileSync(artifactPath, "utf8");
 }
 
+function readUsageFromRunDir(runDir: string): CodexUsage | undefined {
+  const eventsPath = path.join(runDir, "events.jsonl");
+  if (!fs.existsSync(eventsPath)) return undefined;
+  let usage: CodexUsage | undefined;
+  for (const line of fs.readFileSync(eventsPath, "utf8").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const event = JSON.parse(trimmed) as { type?: string; usage?: { input_tokens?: number; cached_input_tokens?: number; output_tokens?: number; reasoning_output_tokens?: number } };
+      if (event.type !== "turn.completed" || !event.usage) continue;
+      const add: CodexUsage = {
+        inputTokens: event.usage.input_tokens ?? 0,
+        cachedInputTokens: event.usage.cached_input_tokens ?? 0,
+        outputTokens: event.usage.output_tokens ?? 0,
+        reasoningOutputTokens: event.usage.reasoning_output_tokens ?? 0,
+      };
+      usage = usage
+        ? {
+            inputTokens: usage.inputTokens + add.inputTokens,
+            cachedInputTokens: usage.cachedInputTokens + add.cachedInputTokens,
+            outputTokens: usage.outputTokens + add.outputTokens,
+            reasoningOutputTokens: usage.reasoningOutputTokens + add.reasoningOutputTokens,
+          }
+        : add;
+    } catch {
+      // skip non-JSON or partial lines
+    }
+  }
+  return usage;
+}
+
+function formatUsageLine(usage: CodexUsage): string {
+  return `usage: \`in=${usage.inputTokens} (cached ${usage.cachedInputTokens}) · out=${usage.outputTokens} · reasoning=${usage.reasoningOutputTokens}\``;
+}
+
 function policyViolationFromJson(policyText: string): boolean {
   try {
     const policy = JSON.parse(policyText) as { policy_violation?: unknown; violation?: unknown };
@@ -936,6 +972,7 @@ async function dispatchCodexRole(role: CodexRole, opts: DispatchCodexRoleOptions
     runDir,
     exitCode,
     stderrTail: stderrTail(stderr),
+    usage: readUsageFromRunDir(runDir),
   };
 }
 
@@ -982,6 +1019,7 @@ function formatDispatchResult(role: CodexRole, result: DispatchCodexRoleResult, 
     `POLICY VIOLATION: ${result.policyViolation ? "true" : "false"}`,
     `policy_violation: \`${result.policyViolation ? "true" : "false"}\``,
     `exit_code: \`${result.exitCode}\``,
+    result.usage ? formatUsageLine(result.usage) : "",
   ];
   if (result.exitCode !== 0) {
     lines.push(`dispatch_error: \`codex-dispatch exited ${result.exitCode}\``);
